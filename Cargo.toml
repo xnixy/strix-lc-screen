@@ -4,7 +4,7 @@ version = "0.1.3"
 edition = "2021"
 description = "Controller for the ROG Strix LC IV pump screen"
 license = "MIT"
-repository = "https://github.com/N3N-X/strix-lc-screen"
+repository = "https://github.com/xnixy/strix-lc-screen"
 readme = "README.md"
 
 [[bin]]
@@ -31,8 +31,8 @@ winreg = "0.55"
 ksni = { version = "0.3", features = ["blocking"] }
 
 [package.metadata.deb]
-maintainer = "N3N-X <n3n-x@users.noreply.github.com>"
-copyright = "2026 N3N-X"
+maintainer = "xnixy <x@ruxn.com>"
+copyright = "2026 xnixy"
 license-file = ["LICENSE", "0"]
 extended-description = """\
 Drives the pump screen on a ROG Strix LC IV cooler.

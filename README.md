@@ -24,7 +24,7 @@ Video is limited to about 20 seconds, sampled at up to 8 frames per second.
 
 ## Downloads
 
-Builds are on the [releases page](https://github.com/N3N-X/strix-lc-screen/releases). Each download includes ffmpeg.
+Builds are on the [releases page](https://github.com/xnixy/strix-lc-screen/releases). Each download includes ffmpeg.
 
 - `strix-lc-screen-windows-x86_64.zip`. Unzip it and run `strix-lc-screen.exe`. Keep `ffmpeg.exe` in that folder.
 - `strix-lc-screen-linux-x86_64.tar.gz`. The program, ffmpeg, and a udev rule.
