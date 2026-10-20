@@ -12,6 +12,8 @@ name = "strix-lc-screen"
 path = "src/main.rs"
 
 [dependencies]
+# Draws the stats panel text. egui already depends on it.
+ab_glyph = "0.2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 eframe = "0.31"
@@ -50,4 +52,5 @@ assets = [
     ["linux/strix-lc-screen.desktop", "usr/share/applications/strix-lc-screen.desktop", "644"],
     ["packaging/ffmpeg", "usr/lib/strix-lc-screen/ffmpeg", "755"],
     ["packaging/FFMPEG.txt", "usr/share/doc/strix-lc-screen/ffmpeg.txt", "644"],
+    ["assets/fonts/OFL.txt", "usr/share/doc/strix-lc-screen/font-license.txt", "644"],
 ]

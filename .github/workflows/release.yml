@@ -31,6 +31,7 @@ jobs:
           Copy-Item target/release/strix-lc-screen.exe $pack/
           Copy-Item $ffmpeg.FullName (Join-Path $pack "ffmpeg.exe")
           Copy-Item packaging/FFMPEG.txt $pack/
+          Copy-Item assets/fonts/OFL.txt (Join-Path $pack "FONT-LICENSE.txt")
           Compress-Archive -Path $pack -DestinationPath dist/strix-lc-screen-windows-x86_64.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -57,6 +58,7 @@ jobs:
           mkdir -p dist/strix-lc-screen
           cp target/release/strix-lc-screen packaging/ffmpeg packaging/FFMPEG.txt \
             linux/60-strix-lc-screen.rules dist/strix-lc-screen/
+          cp assets/fonts/OFL.txt dist/strix-lc-screen/FONT-LICENSE.txt
           chmod 755 dist/strix-lc-screen/strix-lc-screen dist/strix-lc-screen/ffmpeg
           tar -C dist -czf dist/strix-lc-screen-linux-x86_64.tar.gz strix-lc-screen
       - name: Debian package

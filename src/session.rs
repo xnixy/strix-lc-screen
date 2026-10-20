@@ -19,7 +19,23 @@ pub struct Panel {
     /// Result of the first `conn`. A later handshake makes the panel drop the
     /// live picture and go back to its built-in clip.
     identity: Option<serde_json::Value>,
+    /// A USB read or write failed. The handle may be dead, so the caller should open a new one.
+    io_failed: bool,
+    last_write: Instant,
+    /// The live picture channel was closed. The screen refuses to open it
+    /// again until the USB link has been quiet for `RESET_QUIET`.
+    needs_reset: bool,
 }
+
+/// A healthy 720×720 frame takes about 45 ms. When the screen has dropped the
+/// live picture channel it stops taking frames, and one frame takes about 2 s.
+/// Commands sent meanwhile get no reply, so give up on the frame early.
+const FRAME_STALL: Duration = Duration::from_secs(1);
+
+/// Once the live channel closes, the screen refuses to open it again until its
+/// 5-second USB idle watchdog has reset the link. Measured: 3 s of silence is
+/// not enough and 7 s always is.
+const RESET_QUIET: Duration = Duration::from_secs(6);
 
 impl Panel {
     pub fn open() -> Result<Self> {
@@ -34,7 +50,29 @@ impl Panel {
             seq: 0,
             report: vec![0u8; 1025],
             identity: None,
+            io_failed: false,
+            last_write: Instant::now(),
+            needs_reset: false,
         })
+    }
+
+    pub fn io_failed(&self) -> bool {
+        self.io_failed
+    }
+
+    /// Stay off the USB link until the screen's idle watchdog has reset it.
+    /// Returns false if `cancel` asked to stop first.
+    fn wait_for_reset(&self, cancel: &dyn Fn() -> bool) -> bool {
+        loop {
+            if cancel() {
+                return false;
+            }
+            let quiet = self.last_write.elapsed();
+            if quiet >= RESET_QUIET {
+                return true;
+            }
+            std::thread::sleep((RESET_QUIET - quiet).min(Duration::from_millis(100)));
+        }
     }
 
     pub fn connect(&mut self) -> Result<serde_json::Value> {
@@ -62,6 +100,9 @@ impl Panel {
     pub fn power(&mut self, event: &str) -> Result<()> {
         let body = serde_json::json!({ "event": event }).to_string();
         let response = self.call("power", Some(body.as_bytes()))?;
+        if event == "suspend" {
+            self.needs_reset = true;
+        }
         expect_ok(&response, "power")
     }
 
@@ -77,6 +118,18 @@ impl Panel {
         expect_ok(&response, "rotate")
     }
 
+    /// Store one screen option on the pump. Only the commands in `Setting`
+    /// can be sent this way. Firmware upgrade, recovery, factory test, and the
+    /// USB id and serial writers are deliberately not reachable from here.
+    pub fn apply(&mut self, setting: &Setting) -> Result<()> {
+        let (cmd, body) = setting.request();
+        let response = self.call(cmd, Some(body.to_string().as_bytes()))?;
+        if *setting == Setting::ScreenOn(false) {
+            self.needs_reset = true;
+        }
+        expect_ok(&response, cmd)
+    }
+
     /// Wake the panel, turn on the live picture channel, and push one JPEG.
     /// The panel drops that picture about a second after frames stop, and goes
     /// back to its built-in clip. Callers that want a still to remain have to
@@ -88,13 +141,18 @@ impl Panel {
         if cancel() {
             return Ok(());
         }
+        if self.needs_reset && !self.wait_for_reset(cancel) {
+            return Ok(());
+        }
         let _ = self.power("resume");
         let enable = br#"{"enable":true}"#;
         let response = self.call("realtimeDisplay", Some(enable))?;
         if response.code != 200 {
-            let body = String::from_utf8_lossy(&response.body);
-            bail!("the screen refused the picture channel: {body}");
+            // Also refused while the screen is switched off.
+            self.needs_reset = true;
+            bail!("the screen refused the picture channel");
         }
+        self.needs_reset = false;
         self.transport_jpeg(jpeg, cancel)
     }
 
@@ -115,9 +173,14 @@ impl Panel {
             .unwrap_or(1);
         let mut offset = 0usize;
         let mut index = 0u16;
+        let started = Instant::now();
         while offset < jpeg.len() {
             if cancel() {
                 return Ok(());
+            }
+            if started.elapsed() > FRAME_STALL {
+                self.needs_reset = true;
+                bail!("the pump stopped taking the picture");
             }
             let end = (offset + CHUNK).min(jpeg.len());
             let chunk = &jpeg[offset..end];
@@ -134,10 +197,14 @@ impl Panel {
             self.report[7..9].copy_from_slice(&index.to_be_bytes());
             self.report[9] = 0x01;
             self.report[25..25 + chunk.len()].copy_from_slice(chunk);
-            let wrote = self
-                .device
-                .write(&self.report)
-                .context("could not write the picture to the pump")?;
+            let wrote = match self.device.write(&self.report) {
+                Ok(wrote) => wrote,
+                Err(error) => {
+                    self.io_failed = true;
+                    return Err(error).context("could not write the picture to the pump");
+                }
+            };
+            self.last_write = Instant::now();
             if wrote == 0 {
                 bail!("the pump did not accept the picture");
             }
@@ -163,10 +230,14 @@ impl Panel {
         let mut report = Vec::with_capacity(wire.len() + 1);
         report.push(0x00);
         report.extend_from_slice(&wire);
-        let wrote = self
-            .device
-            .write(&report)
-            .with_context(|| format!("HID write failed for {cmd}"))?;
+        let wrote = match self.device.write(&report) {
+            Ok(wrote) => wrote,
+            Err(error) => {
+                self.io_failed = true;
+                return Err(error).with_context(|| format!("HID write failed for {cmd}"));
+            }
+        };
+        self.last_write = Instant::now();
         if wrote < report.len() {
             bail!("{cmd} wrote {wrote} of {} bytes", report.len());
         }
@@ -176,10 +247,13 @@ impl Panel {
         let mut pending = Vec::new();
         while Instant::now() < deadline {
             let mut buf = vec![0u8; 64 * 1024];
-            let read = self
-                .device
-                .read_timeout(&mut buf, 200)
-                .with_context(|| format!("HID read failed for {cmd}"))?;
+            let read = match self.device.read_timeout(&mut buf, 200) {
+                Ok(read) => read,
+                Err(error) => {
+                    self.io_failed = true;
+                    return Err(error).with_context(|| format!("HID read failed for {cmd}"));
+                }
+            };
             if read == 0 {
                 continue;
             }
@@ -202,6 +276,36 @@ impl Panel {
             }
         }
         bail!("{cmd} got no matching reply within 2 seconds")
+    }
+}
+
+/// Options the firmware keeps between power cycles. Names and bodies come from
+/// the command table in the screen firmware (V1.0.6) and the ASUS app.
+///
+/// Left out on purpose:
+/// - `timeout` is the firmware's USB watchdog in seconds, not a screen timer.
+///   A small value makes it reset the USB link.
+/// - `presetThemeId` switches the whole UI theme. Every firmware asset has a
+///   `_0` and `_1` copy, and theme 1 left a pump screen blank.
+/// - `sysinfoDisplay` was accepted but drew nothing on a pump screen.
+/// - `logoId` and `suspendId` have values that could not be put back.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Setting {
+    /// The ASUS app's screen switch. Off turns the panel off, and it stays off
+    /// through power events until it is turned on again.
+    ScreenOn(bool),
+    /// The ASUS app's "Standby mode". On shows the sleep clip while the computer
+    /// sleeps. Off turns the panel off instead.
+    DisplayInSleep(bool),
+}
+
+impl Setting {
+    fn request(&self) -> (&'static str, serde_json::Value) {
+        use serde_json::json;
+        match self {
+            Setting::ScreenOn(on) => ("waterBlockScreen", json!({ "enable": on })),
+            Setting::DisplayInSleep(on) => ("displayInSleep", json!({ "enable": on })),
+        }
     }
 }
 
@@ -239,4 +343,30 @@ fn expect_ok(response: &Response, cmd: &str) -> Result<()> {
     }
     let body = String::from_utf8_lossy(&response.body);
     bail!("{cmd} was rejected with status {}: {body}", response.code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_use_the_firmware_command_names_and_keys() {
+        let cases = [
+            (
+                Setting::ScreenOn(false),
+                "waterBlockScreen",
+                r#"{"enable":false}"#,
+            ),
+            (
+                Setting::DisplayInSleep(true),
+                "displayInSleep",
+                r#"{"enable":true}"#,
+            ),
+        ];
+        for (setting, cmd, body) in cases {
+            let (sent_cmd, sent_body) = setting.request();
+            assert_eq!(sent_cmd, cmd);
+            assert_eq!(sent_body.to_string(), body);
+        }
+    }
 }

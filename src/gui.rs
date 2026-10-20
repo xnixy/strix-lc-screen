@@ -1,8 +1,12 @@
 //! Window for brightness, rotation, and pictures on the pump screen.
 
+use crate::lock;
 use crate::media::{self, photo_jpeg, video_jpegs, Crop};
-use crate::session::Panel;
-use crate::settings::{self, Settings};
+// `Panel` is the USB session with the screen; `stats_panel` draws the stats panel.
+use crate::panel::{self as stats_panel, Composer, Position};
+use crate::session::{Panel, Setting};
+use crate::settings::{self, Settings, Source};
+use crate::stats::{self, Metric};
 use anyhow::{Context, Result};
 use eframe::egui;
 use std::path::PathBuf;
@@ -17,9 +21,16 @@ enum Request {
     Brightness(u8, Sender<Result<Snapshot>>),
     Rotate(u16, Sender<Result<Snapshot>>),
     Power(&'static str, Sender<Result<Snapshot>>),
+    Apply(Setting, Sender<Result<Snapshot>>),
+    /// Stop sending, so the pump goes back to its own animation.
+    Animation(Sender<Result<Snapshot>>),
+    /// Show the stats dashboard as the picture.
+    Dashboard,
     ShowStill(Vec<u8>, Sender<Result<()>>),
     Play(Vec<Vec<u8>>, u64),
     Stop,
+    /// The computer was locked (`true`) or unlocked.
+    Locked(bool),
 }
 
 #[derive(Clone)]
@@ -29,6 +40,8 @@ struct Snapshot {
     brightness: u8,
     rotation: u16,
     free_space: String,
+    screen_on: bool,
+    display_in_sleep: bool,
 }
 
 #[derive(Clone)]
@@ -40,13 +53,13 @@ struct Worker {
 }
 
 impl Worker {
-    fn start() -> Self {
+    fn start(stats: Arc<stats_panel::Shared>) -> Self {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let speed = Arc::new(AtomicU32::new(1000));
         let flag = Arc::clone(&cancel);
         let pace = Arc::clone(&speed);
-        thread::spawn(move || worker_loop(rx, flag, pace));
+        thread::spawn(move || worker_loop(rx, flag, pace, stats));
         Self { tx, cancel, speed }
     }
 
@@ -76,10 +89,14 @@ struct Playing {
     next_at: Instant,
     /// A frame has reached the pump. Later failures give up sooner than the login retry.
     delivered: bool,
+    /// The live picture channel is open. The next frame can skip the wake and channel setup.
+    prepared: bool,
     retries: u8,
     /// One picture, sent again so the panel does not fall back to its built-in clip.
     hold: bool,
     paused: bool,
+    /// Send the stats dashboard in place of the frame.
+    dashboard: bool,
 }
 
 /// The panel drops a live picture about a second after the frames stop.
@@ -92,9 +109,29 @@ fn hold_of(jpeg: Vec<u8>) -> Playing {
         index: 0,
         next_at: Instant::now() + Duration::from_millis(HOLD_MS),
         delivered: true,
+        prepared: true,
         retries: 0,
         hold: true,
         paused: false,
+        dashboard: false,
+    }
+}
+
+/// The dashboard is held like a still. Its frame is replaced as it is sent,
+/// and stays black until the first dashboard is drawn.
+fn dashboard_hold() -> Playing {
+    let black = image::RgbImage::new(stats_panel::SIZE, stats_panel::SIZE);
+    Playing {
+        frames: vec![stats_panel::encode(&black).unwrap_or_default()],
+        frame_ms: HOLD_MS,
+        index: 0,
+        next_at: Instant::now(),
+        delivered: false,
+        prepared: false,
+        retries: 0,
+        hold: true,
+        paused: false,
+        dashboard: true,
     }
 }
 
@@ -111,6 +148,10 @@ fn last_sent_index(next_index: usize, len: usize, delivered: bool) -> Option<usi
 }
 
 fn hold_last(play: Playing) -> Option<Playing> {
+    // The dashboard is already a held picture.
+    if play.dashboard {
+        return Some(play);
+    }
     let index = last_sent_index(play.index, play.frames.len(), play.delivered)?;
     let jpeg = play.frames.get(index)?.clone();
     Some(hold_of(jpeg))
@@ -133,9 +174,15 @@ enum AfterCommand {
     Keep,
 }
 
-fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<AtomicU32>) {
+fn worker_loop(
+    rx: Receiver<Request>,
+    cancel: Arc<AtomicBool>,
+    speed: Arc<AtomicU32>,
+    stats: Arc<stats_panel::Shared>,
+) {
     let mut panel = open_panel();
     let mut playing: Option<Playing> = None;
+    let mut composer = Composer::default();
     loop {
         let wait = match &playing {
             Some(play) if play.paused => Duration::from_secs(3600),
@@ -163,9 +210,11 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
                         index: 0,
                         next_at: Instant::now(),
                         delivered: false,
+                        prepared: false,
                         retries: 0,
                         hold: false,
                         paused: false,
+                        dashboard: false,
                     });
                     cancel.store(false, Ordering::Relaxed);
                 }
@@ -177,17 +226,48 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
                     }
                     let result = (|| {
                         let panel = panel.as_mut().context("pump screen is not connected")?;
-                        panel.show_jpeg(&jpeg, &|| cancel.load(Ordering::Relaxed))
+                        let composed = composer.frame(&stats, &jpeg, false);
+                        let first = composed.as_deref().map_or(jpeg.as_slice(), Vec::as_slice);
+                        panel.show_jpeg(first, &|| cancel.load(Ordering::Relaxed))
                     })();
                     if result.is_ok() && !cancel.load(Ordering::Relaxed) {
                         playing = Some(hold_of(jpeg));
                     }
                     let _ = reply.send(result);
                 }
+                Request::Dashboard => {
+                    cancel.store(false, Ordering::Relaxed);
+                    playing = Some(dashboard_hold());
+                }
+                Request::Locked(locked) => {
+                    if panel.is_none() {
+                        panel = open_panel();
+                    }
+                    if let Some(panel) = panel.as_mut() {
+                        let effect = lock_change(panel, locked);
+                        after_command(&mut playing, effect);
+                    }
+                }
+                Request::Animation(reply) => {
+                    // The pump goes back to its animation about a second after
+                    // frames stop. Closing the channel by command left it blank.
+                    playing = None;
+                    cancel.store(false, Ordering::Relaxed);
+                    if panel.is_none() {
+                        panel = open_panel();
+                    }
+                    let result = (|| {
+                        let panel = panel.as_mut().context("pump screen is not connected")?;
+                        read_snapshot(panel)
+                    })();
+                    let _ = reply.send(result);
+                }
                 other => {
                     let effect = match &other {
                         Request::Power("suspend", _) => AfterCommand::Pause,
                         Request::Power("resume", _) => AfterCommand::Wake,
+                        Request::Apply(Setting::ScreenOn(false), _) => AfterCommand::Pause,
+                        Request::Apply(Setting::ScreenOn(true), _) => AfterCommand::Wake,
                         Request::Brightness(_, _) | Request::Rotate(_, _) => AfterCommand::Rewake,
                         _ => AfterCommand::Keep,
                     };
@@ -195,32 +275,15 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
                         panel = open_panel();
                     }
                     dispatch(&mut panel, other);
-                    match effect {
-                        AfterCommand::Pause => {
-                            if let Some(play) = playing.as_mut() {
-                                play.paused = true;
-                            }
-                        }
-                        AfterCommand::Wake => {
-                            if let Some(play) = playing.as_mut() {
-                                play.paused = false;
-                                play.delivered = false;
-                                play.retries = 0;
-                                play.next_at = Instant::now();
-                            }
-                        }
-                        AfterCommand::Rewake => {
-                            if let Some(play) = playing.as_mut() {
-                                if !play.paused {
-                                    play.delivered = false;
-                                    play.retries = 0;
-                                    play.next_at = Instant::now();
-                                }
-                            }
-                        }
-                        AfterCommand::Keep => {}
-                    }
+                    after_command(&mut playing, effect);
                 }
+            }
+        }
+        // A failed USB read or write can leave a dead handle. Open a new one next time.
+        if panel.as_ref().is_some_and(Panel::io_failed) {
+            panel = None;
+            if let Some(play) = playing.as_mut() {
+                play.prepared = false;
             }
         }
         if cancel.load(Ordering::Relaxed) {
@@ -239,7 +302,7 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
             Some(play) if Instant::now() < play.next_at => continue,
             // Open the picture channel once. Repeating that for every frame
             // of a one-frame hold blanks the panel.
-            Some(play) => Some((!play.delivered, play.index)),
+            Some(play) => Some((!play.prepared, play.index)),
             None => None,
         };
         let Some((prepare, index)) = ready else {
@@ -264,7 +327,10 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
         let began = Instant::now();
         let result = {
             let panel = panel.as_mut().expect("panel is open");
-            let jpeg = &playing.as_ref().expect("clip is loaded").frames[index];
+            let play = playing.as_ref().expect("clip is loaded");
+            let base = &play.frames[index];
+            let composed = composer.frame(&stats, base, play.dashboard);
+            let jpeg = composed.as_deref().map_or(base.as_slice(), Vec::as_slice);
             if prepare {
                 panel.show_jpeg(jpeg, &|| cancel.load(Ordering::Relaxed))
             } else {
@@ -272,10 +338,15 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
             }
         };
         if result.is_err() {
+            if panel.as_ref().is_some_and(Panel::io_failed) {
+                panel = None;
+            }
             // At sign-in the pump USB is often still enumerating. Keep the clip
             // and try again. Once frames are flowing, a few failures mean it left.
+            // The screen may also have closed the live channel, so open it again.
             let give_up = match playing.as_mut() {
                 Some(play) => {
+                    play.prepared = false;
                     let limit = if play.delivered { 3 } else { 40 };
                     play.retries = play.retries.saturating_add(1);
                     if play.retries > limit {
@@ -294,6 +365,7 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
         }
         if let Some(play) = playing.as_mut() {
             play.delivered = true;
+            play.prepared = true;
             play.retries = 0;
             let thousandths = speed.load(Ordering::Relaxed).clamp(250, 2000) as f32 / 1000.0;
             let gap = Duration::from_millis(play.frame_ms);
@@ -309,6 +381,52 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
             let count = play.frames.len();
             play.index = (play.index + 1) % count.max(1);
         }
+    }
+}
+
+fn after_command(playing: &mut Option<Playing>, effect: AfterCommand) {
+    let Some(play) = playing.as_mut() else {
+        return;
+    };
+    match effect {
+        AfterCommand::Pause => play.paused = true,
+        AfterCommand::Wake => {
+            play.paused = false;
+            play.delivered = false;
+            play.prepared = false;
+            play.retries = 0;
+            play.next_at = Instant::now();
+        }
+        AfterCommand::Rewake => {
+            if !play.paused {
+                play.delivered = false;
+                play.prepared = false;
+                play.retries = 0;
+                play.next_at = Instant::now();
+            }
+        }
+        AfterCommand::Keep => {}
+    }
+}
+
+/// Sleep the screen on lock and wake it on unlock. Like the ASUS app, an
+/// unlock does not wake a screen that was switched off.
+fn lock_change(panel: &mut Panel, locked: bool) -> AfterCommand {
+    if locked {
+        return match panel.power("suspend") {
+            Ok(()) => AfterCommand::Pause,
+            Err(_) => AfterCommand::Keep,
+        };
+    }
+    let switched_off = panel
+        .state()
+        .is_ok_and(|state| state["waterBlockScreen"].as_u64() == Some(0));
+    if switched_off {
+        return AfterCommand::Keep;
+    }
+    match panel.power("resume") {
+        Ok(()) => AfterCommand::Wake,
+        Err(_) => AfterCommand::Keep,
     }
 }
 
@@ -351,12 +469,25 @@ fn dispatch(panel: &mut Option<Panel>, request: Request) {
             })();
             let _ = reply.send(result);
         }
+        Request::Apply(setting, reply) => {
+            let result = (|| {
+                let panel = panel.as_mut().context("pump screen is not connected")?;
+                panel.apply(&setting)?;
+                read_snapshot(panel)
+            })();
+            let _ = reply.send(result);
+        }
         Request::ShowStill(_, reply) => {
             let _ = reply.send(Err(anyhow::anyhow!(
                 "the picture was not handed to the pump"
             )));
         }
-        Request::Play(_, _) | Request::Stop => {}
+        Request::Animation(reply) => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "the request was not handed to the pump"
+            )));
+        }
+        Request::Play(_, _) | Request::Stop | Request::Dashboard | Request::Locked(_) => {}
     }
 }
 
@@ -385,6 +516,8 @@ fn read_snapshot(panel: &mut Panel) -> Result<Snapshot> {
         brightness,
         rotation,
         free_space: state["space"].to_string(),
+        screen_on: state["waterBlockScreen"].as_u64() != Some(0),
+        display_in_sleep: state["displayInSleep"].as_u64() == Some(1),
     })
 }
 
@@ -476,6 +609,12 @@ struct App {
     material_applied: bool,
     /// The saved window from the tall layout is resized once.
     window_fitted: bool,
+    /// Read by the lock watcher.
+    follow_lock: Arc<AtomicBool>,
+    /// The tab shown in the Picture card. What the pump shows is `settings.source`.
+    picture_tab: Source,
+    /// Shared with the stats panel thread and the screen worker.
+    stats: Arc<stats_panel::Shared>,
 }
 
 struct TrayMenu {
@@ -494,6 +633,8 @@ struct TrayMenu {
 
 enum JobResult {
     Snapshot(Result<Snapshot>),
+    /// A setting was sent. The string replaces the "working" status on success.
+    Applied(Result<Snapshot>, String),
     Done(Result<()>),
     /// The worker is already playing. The UI only needs the count for its status line.
     Playing(usize),
@@ -508,16 +649,21 @@ impl App {
         ctx: egui::Context,
     ) -> Self {
         let saved = Settings::load();
-        let worker = Worker::start();
+        let stats = Arc::new(stats_panel::Shared::default());
+        stats.configure(panel_config(&saved, true));
+        stats_panel::spawn(Arc::clone(&stats));
+        let worker = Worker::start(Arc::clone(&stats));
         worker.set_speed(saved.speed);
         let pending = Some(spawn_snapshot(&worker));
         let mut chosen = None;
         let mut preview_rx = None;
-        let mut resume_when_ready = false;
+        let mut resume_when_ready = saved.source == Source::Dashboard;
         if let Some(path) = saved.last_path.clone() {
             let path = PathBuf::from(path);
             if path.exists() {
-                resume_when_ready = saved.resume_last;
+                if saved.source == Source::Picture {
+                    resume_when_ready = saved.resume_last;
+                }
                 let (tx, rx) = mpsc::channel();
                 let preview_path = path.clone();
                 thread::spawn(move || {
@@ -530,6 +676,9 @@ impl App {
         if saved.start_with_windows {
             let _ = settings::set_run_at_logon(true, saved.start_in_tray);
         }
+        let picture_tab = saved.source;
+        let follow_lock = Arc::new(AtomicBool::new(saved.sleep_when_locked));
+        spawn_lock_watcher(worker.tx.clone(), Arc::clone(&follow_lock));
         Self {
             worker,
             snapshot: None,
@@ -559,6 +708,17 @@ impl App {
             tray_rx,
             material_applied: false,
             window_fitted: false,
+            follow_lock,
+            picture_tab,
+            stats,
+        }
+    }
+
+    /// Tell the panel thread what to draw. Cheap enough to call every frame.
+    fn sync_stats_panel(&self) {
+        let config = panel_config(&self.settings, !self.in_tray);
+        if self.stats.config() != config {
+            self.stats.configure(config);
         }
     }
 
@@ -608,7 +768,9 @@ impl App {
             self.status = "Quit the ROG STRIX LC app first. The last file was not sent.".into();
             return;
         }
-        if self.chosen.as_ref().is_some_and(|path| path.exists()) {
+        if self.settings.source == Source::Dashboard {
+            self.show_dashboard();
+        } else if self.chosen.as_ref().is_some_and(|path| path.exists()) {
             self.send_chosen();
         }
     }
@@ -632,7 +794,10 @@ impl App {
         self.busy = false;
         match result {
             JobResult::Snapshot(Ok(shot)) => {
-                self.brightness = shot.brightness;
+                // A switched-off screen reports brightness 0. Keep the slider where it was.
+                if shot.screen_on {
+                    self.brightness = shot.brightness;
+                }
                 self.snapshot = Some(shot);
                 self.busy = false;
                 if self.resume_when_ready {
@@ -649,6 +814,16 @@ impl App {
                 self.busy = false;
                 self.status = format!("{error:#}");
                 self.maybe_resume();
+            }
+            JobResult::Applied(Ok(shot), done) => {
+                if shot.screen_on {
+                    self.brightness = shot.brightness;
+                }
+                self.snapshot = Some(shot);
+                self.status = done;
+            }
+            JobResult::Applied(Err(error), _) => {
+                self.status = format!("{error:#}");
             }
             JobResult::Done(Ok(())) => {
                 self.status = "On the pump. It stays while this app is open.".into();
@@ -750,6 +925,7 @@ impl eframe::App for App {
         self.poll(ctx);
         self.poll_preview(ctx);
         self.refresh_asus_flag();
+        self.sync_stats_panel();
         let waiting = self.pending.is_some() || self.preview_rx.is_some();
         if waiting {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -877,6 +1053,18 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 
 fn dim(text: &str) -> egui::RichText {
     egui::RichText::new(text).color(egui::Color32::from_rgb(186, 180, 186))
+}
+
+/// The main action of a card.
+fn accent_button(text: &str) -> egui::Button<'static> {
+    egui::Button::new(
+        egui::RichText::new(text)
+            .strong()
+            .color(egui::Color32::WHITE),
+    )
+    .fill(ACCENT)
+    .corner_radius(egui::CornerRadius::same(10))
+    .min_size(egui::vec2(160.0, 34.0))
 }
 
 fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
@@ -1031,81 +1219,164 @@ impl App {
 
     fn picture_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         section(ui, "Picture", |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Choose file…").clicked() && !self.busy {
-                    self.choose_file(ctx);
-                }
-                if let Some(path) = &self.chosen {
-                    let name = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("chosen file");
-                    ui.label(egui::RichText::new(name).strong())
-                        .on_hover_text(path.display().to_string());
+            ui.horizontal_wrapped(|ui| {
+                for (tab, label) in [
+                    (Source::Picture, "Your photo or video"),
+                    (Source::Dashboard, "Stats dashboard"),
+                    (Source::Animation, "Pump animation"),
+                ] {
+                    let selected = self.picture_tab == tab;
+                    // A dot marks what the pump is showing.
+                    let label = if self.settings.source == tab {
+                        format!("● {label}")
+                    } else {
+                        label.to_string()
+                    };
+                    let mut text = egui::RichText::new(label);
+                    if selected {
+                        text = text.strong().color(egui::Color32::WHITE);
+                    }
+                    let mut button =
+                        egui::Button::new(text).corner_radius(egui::CornerRadius::same(10));
+                    if selected {
+                        button = button.fill(ACCENT);
+                    }
+                    if ui.add(button).clicked() {
+                        self.picture_tab = tab;
+                    }
                 }
             });
-            if let Some(preview) = &self.preview {
-                ui.label(dim("Drag the square to crop."));
-                let crop_settled = crop_view(
-                    ui,
-                    preview,
-                    self.source_width,
-                    self.source_height,
-                    &mut self.zoom,
-                    &mut self.pan_x,
-                    &mut self.pan_y,
-                );
-                if crop_settled {
-                    self.persist();
-                }
+            ui.add_space(6.0);
+            if self.snapshot.as_ref().is_some_and(|shot| !shot.screen_on) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 186, 110),
+                        "The screen is switched off, so nothing shows.",
+                    );
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Turn on"))
+                        .clicked()
+                    {
+                        self.apply_setting(Setting::ScreenOn(true));
+                    }
+                });
+                ui.add_space(4.0);
             }
-            ui.horizontal(|ui| {
-                let zoom_slider = ui.add(egui::Slider::new(&mut self.zoom, 1.0..=4.0).text("Zoom"));
-                if zoom_slider.drag_stopped() {
-                    self.persist();
-                }
-                if ui.button("Reset").clicked() {
-                    self.zoom = 1.0;
-                    self.pan_x = 0.0;
-                    self.pan_y = 0.0;
-                    self.persist();
-                }
-            });
-            ui.horizontal(|ui| {
-                let speed_slider = ui.add(
-                    egui::Slider::new(&mut self.speed, 0.25..=2.0)
-                        .fixed_decimals(2)
-                        .text("Speed")
-                        .suffix("×"),
-                );
-                if speed_slider.drag_stopped() {
-                    self.worker.set_speed(self.speed);
-                    self.persist();
-                } else if speed_slider.changed() {
-                    self.worker.set_speed(self.speed);
-                }
-            });
-            ui.label(dim(
-                "1× matches the video. Crop applies the next time you press Show.",
-            ));
-            ui.horizontal(|ui| {
-                let can_send = self.chosen.is_some() && !self.busy;
-                let show = egui::Button::new(
-                    egui::RichText::new("Show on pump")
-                        .strong()
-                        .color(egui::Color32::WHITE),
-                )
-                .fill(ACCENT)
-                .corner_radius(egui::CornerRadius::same(10))
-                .min_size(egui::vec2(160.0, 34.0));
-                if ui.add_enabled(can_send, show).clicked() {
-                    self.send_chosen();
-                }
-                if ui.button("Stop video").clicked() {
-                    self.worker.stop_playback();
-                    self.status = "Stopped. The last frame stays until you quit.".into();
-                }
-            });
+            match self.picture_tab {
+                Source::Picture => self.my_picture(ui, ctx),
+                Source::Dashboard => self.dashboard_tab(ui),
+                Source::Animation => self.animation_tab(ui),
+            }
+        });
+    }
+
+    fn dashboard_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(dim(
+            "The readings picked under Stats panel, on a dark background. \
+             This app draws it once a second, so it stops updating when the app quits.",
+        ));
+        ui.add_space(6.0);
+        let showing = self.settings.source == Source::Dashboard;
+        let ready = !self.settings.stats_items.is_empty() && !self.busy;
+        if showing {
+            ui.label(egui::RichText::new("On the pump now.").strong());
+        } else if ui
+            .add_enabled(ready, accent_button("Show dashboard on pump"))
+            .clicked()
+        {
+            self.show_dashboard();
+        }
+        if self.settings.stats_items.is_empty() {
+            ui.label(dim("Pick some readings under Stats panel first."));
+        }
+    }
+
+    fn animation_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(dim(
+            "The animation stored in the pump. Nothing is sent from this computer, \
+             so it keeps playing after this app quits.",
+        ));
+        ui.add_space(6.0);
+        if self.settings.source == Source::Animation {
+            ui.label(egui::RichText::new("On the pump now.").strong());
+        } else if ui
+            .add_enabled(!self.busy, accent_button("Show pump animation"))
+            .clicked()
+        {
+            self.show_animation();
+        }
+    }
+
+    fn my_picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            if ui.button("Choose file…").clicked() && !self.busy {
+                self.choose_file(ctx);
+            }
+            if let Some(path) = &self.chosen {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("chosen file");
+                ui.label(egui::RichText::new(name).strong())
+                    .on_hover_text(path.display().to_string());
+            }
+        });
+        if let Some(preview) = &self.preview {
+            ui.label(dim("Drag the square to crop."));
+            let crop_settled = crop_view(
+                ui,
+                preview,
+                self.source_width,
+                self.source_height,
+                &mut self.zoom,
+                &mut self.pan_x,
+                &mut self.pan_y,
+            );
+            if crop_settled {
+                self.persist();
+            }
+        }
+        ui.horizontal(|ui| {
+            let zoom_slider = ui.add(egui::Slider::new(&mut self.zoom, 1.0..=4.0).text("Zoom"));
+            if zoom_slider.drag_stopped() {
+                self.persist();
+            }
+            if ui.button("Reset").clicked() {
+                self.zoom = 1.0;
+                self.pan_x = 0.0;
+                self.pan_y = 0.0;
+                self.persist();
+            }
+        });
+        ui.horizontal(|ui| {
+            let speed_slider = ui.add(
+                egui::Slider::new(&mut self.speed, 0.25..=2.0)
+                    .fixed_decimals(2)
+                    .text("Speed")
+                    .suffix("×"),
+            );
+            if speed_slider.drag_stopped() {
+                self.worker.set_speed(self.speed);
+                self.persist();
+            } else if speed_slider.changed() {
+                self.worker.set_speed(self.speed);
+            }
+        });
+        ui.label(dim(
+            "1× matches the video. Crop applies the next time you press Show.",
+        ));
+        ui.horizontal(|ui| {
+            let can_send = self.chosen.is_some() && !self.busy;
+            if ui
+                .add_enabled(can_send, accent_button("Show on pump"))
+                .clicked()
+            {
+                self.send_chosen();
+            }
+            if ui.button("Stop video").clicked() {
+                self.worker.stop_playback();
+                self.status = "Stopped. The last frame stays until you quit.".into();
+            }
         });
     }
 
@@ -1113,7 +1384,11 @@ impl App {
         section(ui, "Screen", |ui| {
             ui.horizontal(|ui| {
                 ui.label(dim("Brightness"));
-                let slider = ui.add(egui::Slider::new(&mut self.brightness, 0..=100).suffix("%"));
+                let screen_on = self.snapshot.as_ref().is_none_or(|shot| shot.screen_on);
+                let slider = ui.add_enabled(
+                    screen_on,
+                    egui::Slider::new(&mut self.brightness, 0..=100).suffix("%"),
+                );
                 if slider.drag_stopped() && !self.busy {
                     self.apply_brightness();
                 }
@@ -1143,6 +1418,28 @@ impl App {
                     self.pending = Some(spawn_snapshot(&self.worker));
                 }
             });
+            if let Some(shot) = self.snapshot.clone() {
+                let mut screen_on = shot.screen_on;
+                let toggle = ui
+                    .add_enabled(!self.busy, egui::Checkbox::new(&mut screen_on, "Screen on"))
+                    .on_hover_text("Off keeps the panel dark until you turn it back on.");
+                if toggle.changed() {
+                    self.apply_setting(Setting::ScreenOn(screen_on));
+                }
+                let mut standby = shot.display_in_sleep;
+                let toggle = ui
+                    .add_enabled(
+                        !self.busy,
+                        egui::Checkbox::new(
+                            &mut standby,
+                            "Play the standby clip while the computer sleeps",
+                        ),
+                    )
+                    .on_hover_text("Off turns the panel off while the computer sleeps.");
+                if toggle.changed() {
+                    self.apply_setting(Setting::DisplayInSleep(standby));
+                }
+            }
         });
         ui.add_space(8.0);
         section(ui, "Startup and tray", |ui| {
@@ -1197,98 +1494,245 @@ impl App {
             {
                 self.persist();
             }
+            if ui
+                .checkbox(
+                    &mut self.settings.sleep_when_locked,
+                    "Sleep the pump screen while this computer is locked",
+                )
+                .changed()
+            {
+                self.follow_lock
+                    .store(self.settings.sleep_when_locked, Ordering::Relaxed);
+                self.persist();
+            }
             ui.label(dim(
                 "Click the tray icon to show this window. Right-click it to stop or quit.",
             ));
         });
+        ui.add_space(8.0);
+        self.stats_card(ui);
+    }
+
+    fn stats_card(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Stats panel", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .checkbox(
+                        &mut self.settings.stats_on_picture,
+                        "Show on your photo or video",
+                    )
+                    .changed()
+                {
+                    self.persist();
+                }
+                if self.settings.stats_on_picture {
+                    for (position, label) in [(Position::Top, "Top"), (Position::Bottom, "Bottom")]
+                    {
+                        let mut button = egui::Button::new(label);
+                        if self.settings.stats_position == position {
+                            button = button.fill(ACCENT);
+                        }
+                        if ui.add(button).clicked() {
+                            self.settings.stats_position = position;
+                            self.persist();
+                        }
+                    }
+                }
+            });
+            ui.label(dim(&format!(
+                "Up to {} readings plus the time and date. A photo or video shows the first {}.",
+                stats_panel::MAX_TILES,
+                stats_panel::MAX_ON_PICTURE
+            )));
+            ui.add_space(4.0);
+            let readings = self.stats.readings();
+            let mut changed = false;
+            for group in [
+                "CPU", "GPU", "Memory", "Disk", "Network", "Cooling", "Clock",
+            ] {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_sized([62.0, 20.0], egui::Label::new(dim(group)));
+                    for metric in stats::ALL
+                        .into_iter()
+                        .filter(|metric| metric.group() == group)
+                    {
+                        changed |= self.metric_checkbox(ui, metric, readings.as_ref());
+                    }
+                });
+            }
+            if changed {
+                self.persist();
+            }
+            if let Some(readings) = &readings {
+                let missing = |source| {
+                    stats::ALL
+                        .iter()
+                        .any(|metric| metric.source() == source && !readings.has(*metric))
+                };
+                if cfg!(windows) && missing(stats::Source::HwInfo) {
+                    ui.label(dim(
+                        "CPU temperature and power, pump, coolant, and fan speeds come from \
+                         HWiNFO. Run it with Shared Memory Support turned on in its settings.",
+                    ));
+                }
+                if missing(stats::Source::Nvidia) {
+                    ui.label(dim("GPU readings need an NVIDIA card."));
+                }
+            }
+        });
+    }
+
+    /// One reading's checkbox, with its live value. Returns true if it changed.
+    fn metric_checkbox(
+        &mut self,
+        ui: &mut egui::Ui,
+        metric: Metric,
+        readings: Option<&stats::Readings>,
+    ) -> bool {
+        let chosen = self.settings.stats_items.contains(&metric);
+        let clock = matches!(metric, Metric::Time | Metric::Date);
+        let available = clock || readings.is_none_or(|readings| readings.has(metric));
+        let readings_chosen = self
+            .settings
+            .stats_items
+            .iter()
+            .filter(|metric| !matches!(metric, Metric::Time | Metric::Date))
+            .count();
+        let full = !clock && readings_chosen >= stats_panel::MAX_TILES;
+        let label = match readings.filter(|_| available && !clock) {
+            Some(readings) => format!("{} {}", metric.name(), readings.text(metric)),
+            None => metric.name().to_string(),
+        };
+        let mut on = chosen;
+        let response = ui.add_enabled(
+            available && (chosen || !full),
+            egui::Checkbox::new(&mut on, label),
+        );
+        let response = if !available {
+            response.on_disabled_hover_text(match metric.source() {
+                stats::Source::Nvidia => "Needs an NVIDIA card.",
+                _ if cfg!(windows) => "Needs HWiNFO running with Shared Memory Support on.",
+                _ => "This computer does not report it.",
+            })
+        } else if full && !chosen {
+            response.on_disabled_hover_text("Take another reading off first.")
+        } else {
+            response
+        };
+        if !response.changed() {
+            return false;
+        }
+        if on {
+            self.settings.stats_items.push(metric);
+            // Keep the window's order, so the panel matches the list.
+            self.settings
+                .stats_items
+                .sort_by_key(|item| stats::ALL.iter().position(|metric| metric == item));
+        } else {
+            self.settings.stats_items.retain(|item| *item != metric);
+        }
+        true
+    }
+
+    /// Hand one request to the screen worker. The reply refreshes the controls.
+    /// `working` shows while the pump is busy and `done` replaces it on success.
+    fn run_on_worker(
+        &mut self,
+        working: String,
+        done: String,
+        request: impl FnOnce(Sender<Result<Snapshot>>) -> Request + Send + 'static,
+    ) {
+        if self.asus_running {
+            self.status = "Quit the ROG STRIX LC app first.".into();
+            return;
+        }
+        self.busy = true;
+        self.status = working;
+        let (tx, rx) = mpsc::channel();
+        let worker_tx = self.worker.tx.clone();
+        thread::spawn(move || {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            let result = if worker_tx.send(request(reply_tx)).is_err() {
+                Err(anyhow_worker())
+            } else {
+                reply_rx.recv().unwrap_or_else(|_| Err(anyhow_worker()))
+            };
+            let _ = tx.send(JobResult::Applied(result, done));
+        });
+        self.pending = Some(rx);
     }
 
     fn apply_brightness(&mut self) {
-        if self.asus_running {
-            self.status = "Quit the ROG STRIX LC app first.".into();
-            return;
-        }
-        self.busy = true;
-        self.status = "Setting brightness…".into();
-        let (tx, rx) = mpsc::channel();
         let value = self.brightness;
-        let worker_tx = self.worker.tx.clone();
-        thread::spawn(move || {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            if worker_tx
-                .send(Request::Brightness(value, reply_tx))
-                .is_err()
-            {
-                let _ = tx.send(JobResult::Snapshot(Err(anyhow_worker())));
-                return;
-            }
-            match reply_rx.recv() {
-                Ok(result) => {
-                    let _ = tx.send(JobResult::Snapshot(result));
-                }
-                Err(_) => {
-                    let _ = tx.send(JobResult::Snapshot(Err(anyhow_worker())));
-                }
-            }
-        });
-        self.pending = Some(rx);
+        self.run_on_worker(
+            "Setting brightness…".into(),
+            format!("Brightness is {value}%."),
+            move |reply| Request::Brightness(value, reply),
+        );
     }
 
     fn apply_rotation(&mut self, degrees: u16) {
-        if self.asus_running {
-            self.status = "Quit the ROG STRIX LC app first.".into();
-            return;
-        }
-        self.busy = true;
-        self.status = format!("Rotating to {degrees}°…");
-        let (tx, rx) = mpsc::channel();
-        let worker_tx = self.worker.tx.clone();
-        thread::spawn(move || {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            if worker_tx.send(Request::Rotate(degrees, reply_tx)).is_err() {
-                let _ = tx.send(JobResult::Snapshot(Err(anyhow_worker())));
-                return;
-            }
-            match reply_rx.recv() {
-                Ok(result) => {
-                    let _ = tx.send(JobResult::Snapshot(result));
-                }
-                Err(_) => {
-                    let _ = tx.send(JobResult::Snapshot(Err(anyhow_worker())));
-                }
-            }
-        });
-        self.pending = Some(rx);
+        self.run_on_worker(
+            format!("Rotating to {degrees}°…"),
+            format!("Rotated to {degrees}°."),
+            move |reply| Request::Rotate(degrees, reply),
+        );
     }
 
     fn apply_power(&mut self, event: &'static str) {
+        let (working, done) = match event {
+            "resume" => ("Waking the screen…", "The screen is awake."),
+            _ => ("Putting the screen to sleep…", "The screen is asleep."),
+        };
+        self.run_on_worker(working.into(), done.into(), move |reply| {
+            Request::Power(event, reply)
+        });
+    }
+
+    fn show_animation(&mut self) {
         if self.asus_running {
             self.status = "Quit the ROG STRIX LC app first.".into();
             return;
         }
-        self.busy = true;
-        self.status = match event {
-            "resume" => "Waking the screen…".into(),
-            _ => "Putting the screen to sleep…".into(),
+        self.settings.source = Source::Animation;
+        self.persist();
+        self.run_on_worker(
+            "Stopping the picture…".into(),
+            "The pump animation comes back about a second after the picture stops.".into(),
+            Request::Animation,
+        );
+    }
+
+    fn show_dashboard(&mut self) {
+        if self.asus_running {
+            self.status = "Quit the ROG STRIX LC app first.".into();
+            return;
+        }
+        if self.worker.tx.send(Request::Dashboard).is_err() {
+            self.status = format!("{:#}", anyhow_worker());
+            return;
+        }
+        self.settings.source = Source::Dashboard;
+        self.persist();
+        self.status = "Showing the stats dashboard. It updates once a second.".into();
+    }
+
+    fn apply_setting(&mut self, setting: Setting) {
+        let (working, done) = match &setting {
+            Setting::ScreenOn(true) => ("Turning the screen on…", "The screen is on.".into()),
+            Setting::ScreenOn(false) => ("Turning the screen off…", "The screen is off.".into()),
+            Setting::DisplayInSleep(true) => (
+                "Setting standby mode…",
+                "The standby clip plays while the computer sleeps.".into(),
+            ),
+            Setting::DisplayInSleep(false) => (
+                "Setting standby mode…",
+                "The screen turns off while the computer sleeps.".into(),
+            ),
         };
-        let (tx, rx) = mpsc::channel();
-        let worker_tx = self.worker.tx.clone();
-        thread::spawn(move || {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            if worker_tx.send(Request::Power(event, reply_tx)).is_err() {
-                let _ = tx.send(JobResult::Snapshot(Err(anyhow_worker())));
-                return;
-            }
-            match reply_rx.recv() {
-                Ok(result) => {
-                    let _ = tx.send(JobResult::Snapshot(result));
-                }
-                Err(_) => {
-                    let _ = tx.send(JobResult::Snapshot(Err(anyhow_worker())));
-                }
-            }
+        self.run_on_worker(working.into(), done, move |reply| {
+            Request::Apply(setting, reply)
         });
-        self.pending = Some(rx);
     }
 
     fn choose_file(&mut self, ctx: &egui::Context) {
@@ -1328,6 +1772,10 @@ impl App {
         let Some(path) = self.chosen.clone() else {
             return;
         };
+        if self.settings.source != Source::Picture {
+            self.settings.source = Source::Picture;
+            self.persist();
+        }
         self.worker.stop_playback();
         self.busy = true;
         let (tx, rx) = mpsc::channel();
@@ -1405,6 +1853,42 @@ fn spawn_snapshot(worker: &Worker) -> Receiver<JobResult> {
         }
     });
     rx
+}
+
+/// What the stats panel thread should draw for these settings.
+fn panel_config(settings: &Settings, window_open: bool) -> stats_panel::Config {
+    stats_panel::Config {
+        items: settings.stats_items.clone(),
+        on_picture: settings.stats_on_picture && settings.source == Source::Picture,
+        position: settings.stats_position,
+        dashboard: settings.source == Source::Dashboard,
+        window_open,
+    }
+}
+
+fn spawn_lock_watcher(worker_tx: Sender<Request>, follow_lock: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let mut last: Option<bool> = None;
+        loop {
+            thread::sleep(lock::POLL);
+            if !follow_lock.load(Ordering::Relaxed) || asus_app_running() {
+                last = None;
+                continue;
+            }
+            let Some(locked) = lock::session_locked() else {
+                continue;
+            };
+            // The first reading only matters if the computer is already locked.
+            let changed = match last {
+                Some(before) => before != locked,
+                None => locked,
+            };
+            last = Some(locked);
+            if changed && worker_tx.send(Request::Locked(locked)).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 fn asus_app_running() -> bool {

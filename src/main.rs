@@ -1,15 +1,21 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod frame;
+mod gpu;
 mod gui;
+mod hwinfo;
+mod lock;
 mod media;
 mod msg;
+mod panel;
+mod sensors;
 mod session;
 mod settings;
+mod stats;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use session::Panel;
+use session::{Panel, Setting};
 
 #[derive(Parser)]
 #[command(
@@ -33,12 +39,28 @@ enum Command {
     Power { event: PowerEvent },
     /// Send one photo to the pump. The panel drops it when this command exits.
     Show { path: std::path::PathBuf },
+    /// Turn the screen on or off. Off stays off until it is turned on again.
+    Screen { state: Switch },
+    /// Play the standby clip while the computer sleeps, or turn the panel off.
+    Standby { state: Switch },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum PowerEvent {
     Resume,
     Suspend,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+impl Switch {
+    fn on(self) -> bool {
+        matches!(self, Switch::On)
+    }
 }
 
 fn main() -> Result<()> {
@@ -96,8 +118,28 @@ fn main() -> Result<()> {
             panel.show_jpeg(&jpeg, &|| false)?;
             println!("picture sent");
         }
+        Command::Screen { state } => {
+            ensure_official_app_is_closed()?;
+            panel.apply(&Setting::ScreenOn(state.on()))?;
+            let state = panel.state()?;
+            println!("screen is {}", on_off(&state["waterBlockScreen"]));
+        }
+        Command::Standby { state } => {
+            ensure_official_app_is_closed()?;
+            panel.apply(&Setting::DisplayInSleep(state.on()))?;
+            let state = panel.state()?;
+            println!("standby clip is {}", on_off(&state["displayInSleep"]));
+        }
     }
     Ok(())
+}
+
+fn on_off(value: &serde_json::Value) -> &'static str {
+    match value.as_u64() {
+        Some(0) => "off",
+        Some(_) => "on",
+        None => "unknown",
+    }
 }
 
 fn attach_console() {
@@ -151,5 +193,6 @@ fn print_state(identity: &serde_json::Value, state: &serde_json::Value) {
     println!("brightness: {}", state["brightness"]);
     println!("rotation:   {}", state["degree"]);
     println!("free space: {}", state["space"]);
-    println!("sleep show: {}", state["displayInSleep"]);
+    println!("screen:     {}", on_off(&state["waterBlockScreen"]));
+    println!("standby:    {}", on_off(&state["displayInSleep"]));
 }

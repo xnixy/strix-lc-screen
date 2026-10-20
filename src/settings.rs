@@ -1,5 +1,7 @@
 //! Saved options and the sign-in startup entry.
 
+use crate::panel::Position;
+use crate::stats::Metric;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -9,7 +11,9 @@ use std::sync::OnceLock;
 #[cfg(windows)]
 const RUN_VALUE: &str = "strix-lc-screen";
 
+/// Fields missing from an older settings file take their default value.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub close_to_tray: bool,
     pub start_with_windows: bool,
@@ -21,6 +25,28 @@ pub struct Settings {
     pub pan_x: f32,
     pub pan_y: f32,
     pub speed: f32,
+    /// Put the pump screen to sleep while this computer is locked.
+    pub sleep_when_locked: bool,
+    /// What the pump shows when the app starts.
+    pub source: Source,
+    /// Readings on the stats panel, in the order they were picked. Uses a new
+    /// field name: older builds stored firmware overlay names in `overlay_items`.
+    pub stats_items: Vec<Metric>,
+    /// Draw the stats panel over the photo or video.
+    pub stats_on_picture: bool,
+    pub stats_position: Position,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    /// The chosen photo or video.
+    #[default]
+    Picture,
+    /// The stats dashboard.
+    Dashboard,
+    /// The pump's own animation. Nothing is sent.
+    Animation,
 }
 
 impl Default for Settings {
@@ -35,6 +61,20 @@ impl Default for Settings {
             pan_x: 0.0,
             pan_y: 0.0,
             speed: 1.0,
+            sleep_when_locked: false,
+            source: Source::Picture,
+            stats_items: vec![
+                Metric::Time,
+                Metric::Date,
+                Metric::CpuUsage,
+                Metric::CpuClock,
+                Metric::GpuUsage,
+                Metric::GpuTemp,
+                Metric::MemoryUsage,
+                Metric::NetDown,
+            ],
+            stats_on_picture: false,
+            stats_position: Position::Bottom,
         }
     }
 }
@@ -257,6 +297,27 @@ fn claim_named(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_settings_file_keeps_its_values() {
+        let old = r#"{"close_to_tray":false,"start_with_windows":true,"start_in_tray":true,
+            "resume_last":true,"last_path":"C:\\clip.mp4","zoom":2.0,"pan_x":0.5,"pan_y":0.0,"speed":1.5}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        assert!(!settings.close_to_tray);
+        assert_eq!(settings.speed, 1.5);
+        assert!(!settings.sleep_when_locked);
+        assert_eq!(settings.source, Source::Picture);
+    }
+
+    #[test]
+    fn fields_from_the_firmware_overlay_build_are_ignored() {
+        let previous = r#"{"speed":1.25,"built_in_clip":true,"overlay_items":["CPU Usage"],
+            "sleep_when_locked":true}"#;
+        let settings: Settings = serde_json::from_str(previous).unwrap();
+        assert_eq!(settings.speed, 1.25);
+        assert!(settings.sleep_when_locked);
+        assert!(!settings.stats_items.is_empty());
+    }
 
     #[test]
     fn hidden_startup_adds_the_tray_flag() {

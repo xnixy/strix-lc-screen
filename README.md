@@ -13,6 +13,16 @@ The panel is a 720×720 screen on USB device `0B05:1DE7`. This app talks to that
 - Change playback speed from 0.25× to 2× while the clip is running. 1× matches the length of the video.
 - Close the window and leave the clip running. A tray icon stays behind.
 - Start the app when you sign in, hidden in the tray if you want, and send the last file again on its own.
+- Show a stats panel, drawn the way the ASUS app does it: a band over your photo or video, or a full dashboard. Pick up to 6 readings plus the time and date: CPU usage and clock, GPU usage, clock, temperature, power, fan, and memory (NVIDIA cards), RAM, disk space and speed, and network speed. The app redraws it once a second, so it stops updating when the app quits.
+- Go back to the pump's own animation. It is stored in the pump, so it keeps playing after this app quits.
+- Turn the screen on or off, and choose whether it plays the standby clip while the computer sleeps. These are the same switches the ASUS app has, and the pump remembers them.
+- Put the pump screen to sleep while the computer is locked.
+
+### CPU temperature, pump, and fan speeds
+
+Windows does not let programs read these without a driver. If [HWiNFO](https://www.hwinfo.com/) is running with **Shared Memory Support** turned on in its settings, the stats panel also offers CPU temperature and power, pump speed, coolant temperature, and fan speed. On Linux, CPU temperature comes from the kernel.
+
+The pump and fans are not controlled by this USB device. They run from the motherboard headers, so set their curves in the BIOS or a fan control program.
 
 Click the tray icon to open the window. Right-click it to stop the video or quit. **Stop video** leaves the last frame on the pump. **Quit** exits the program.
 
@@ -73,12 +83,15 @@ With no arguments, the program opens the window. Sign-in startup uses `--tray`, 
 .\target\release\strix-lc-screen.exe power resume
 .\target\release\strix-lc-screen.exe power suspend
 .\target\release\strix-lc-screen.exe show "C:\Pictures\photo.png"
+.\target\release\strix-lc-screen.exe screen off
+.\target\release\strix-lc-screen.exe standby on
+.\target\release\strix-lc-screen.exe clip 2
 ```
 
-The same commands work on Linux. `power resume` wakes the screen. `power suspend` puts it to sleep. Rotation is 0, 90, 180, or 270. Brightness is 0 through 100.
+The same commands work on Linux. `power resume` wakes the screen. `power suspend` puts it to sleep. `screen off` keeps it dark, even after a wake, until `screen on`. Rotation is 0, 90, 180, or 270. Brightness is 0 through 100. `clip` plays built-in clip 1 or 2. If this app is running and sending a picture, use its window instead, or the picture covers the clip again.
 
 Settings are saved in `%APPDATA%\strix-lc-screen\settings.json` on Windows, and in `~/.config/strix-lc-screen/settings.json` on Linux.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). ffmpeg in the downloads is a separate program, under the LGPLv2.1. `FFMPEG.txt` in the download has the build it came from.
+MIT. See [LICENSE](LICENSE). ffmpeg in the downloads is a separate program, under the LGPLv2.1. `FFMPEG.txt` in the download has the build it came from. The stats panel uses the Rajdhani font by the Indian Type Foundry, under the SIL Open Font License. See [assets/fonts/OFL.txt](assets/fonts/OFL.txt).
