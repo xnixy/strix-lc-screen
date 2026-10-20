@@ -39,18 +39,35 @@ fn fonts() -> &'static (FontRef<'static>, FontRef<'static>) {
     })
 }
 
-/// A band of readings over a transparent canvas, for a photo or video.
+/// A band of readings over a transparent canvas, for a photo or video. The
+/// time and date get their own line on top and do not use up reading slots.
 pub fn overlay(readings: &Readings, items: &[Metric], position: Position) -> RgbaImage {
     let mut canvas = RgbaImage::new(SIZE, SIZE);
-    let items: Vec<Metric> = items.iter().copied().take(MAX_ON_PICTURE).collect();
-    if items.is_empty() {
+    let clock: Vec<Metric> = items
+        .iter()
+        .copied()
+        .filter(|metric| matches!(metric, Metric::Time | Metric::Date))
+        .collect();
+    let items: Vec<Metric> = items
+        .iter()
+        .copied()
+        .filter(|metric| !clock.contains(metric))
+        .take(MAX_ON_PICTURE)
+        .collect();
+    if items.is_empty() && clock.is_empty() {
         return canvas;
     }
-    let columns = items.len().min(3);
+    let columns = items.len().clamp(1, 3);
     let rows = items.len().div_ceil(3);
     let margin = 22.0;
     let row_height = 118.0;
-    let height = row_height * rows as f32 + 20.0;
+    let clock_height = if clock.is_empty() { 0.0 } else { 62.0 };
+    let height = clock_height
+        + if rows > 0 {
+            row_height * rows as f32 + 20.0
+        } else {
+            10.0
+        };
     let top = match position {
         Position::Top => margin,
         Position::Bottom => SIZE as f32 - margin - height,
@@ -65,6 +82,10 @@ pub fn overlay(readings: &Readings, items: &[Metric], position: Position) -> Rgb
         22.0,
         Rgba([8, 6, 12, 190]),
     );
+    if !clock.is_empty() {
+        clock_line(&mut canvas, readings, &clock, top + 50.0);
+    }
+    let top = top + clock_height;
     let cell_width = (right - left - 20.0) / columns as f32;
     for (index, metric) in items.iter().enumerate() {
         let (row, column) = (index / 3, index % 3);
@@ -88,6 +109,57 @@ pub fn overlay(readings: &Readings, items: &[Metric], position: Position) -> Rgb
         );
     }
     canvas
+}
+
+/// "19:45  MON 19 OCT", centered, with the time larger than the date.
+fn clock_line(canvas: &mut RgbaImage, readings: &Readings, clock: &[Metric], baseline: f32) {
+    let (bold, semi) = fonts();
+    let time = clock
+        .contains(&Metric::Time)
+        .then(|| readings.text(Metric::Time));
+    let date = clock
+        .contains(&Metric::Date)
+        .then(|| readings.text(Metric::Date));
+    let (time_size, date_size, gap) = (44.0, 30.0, 18.0);
+    let time_width = time
+        .as_deref()
+        .map_or(0.0, |text| measure(bold, time_size, text));
+    let date_width = date
+        .as_deref()
+        .map_or(0.0, |text| measure(semi, date_size, text));
+    let gap = if time.is_some() && date.is_some() {
+        gap
+    } else {
+        0.0
+    };
+    let mut x = (SIZE as f32 - time_width - gap - date_width) / 2.0;
+    if let Some(time) = &time {
+        text(
+            canvas,
+            bold,
+            time_size,
+            x,
+            baseline,
+            time,
+            WHITE,
+            Align::Left,
+            400.0,
+        );
+        x += time_width + gap;
+    }
+    if let Some(date) = &date {
+        text(
+            canvas,
+            semi,
+            date_size,
+            x,
+            baseline,
+            date,
+            MUTED,
+            Align::Left,
+            400.0,
+        );
+    }
 }
 
 fn reading_cell(
@@ -630,6 +702,25 @@ mod tests {
             Some(64.0 * 1_073_741_824.0),
         );
         readings
+    }
+
+    #[test]
+    fn time_and_date_do_not_take_a_reading_slot() {
+        let six = [
+            Metric::CpuUsage,
+            Metric::CpuClock,
+            Metric::GpuUsage,
+            Metric::GpuTemp,
+            Metric::MemoryUsed,
+            Metric::NetDown,
+        ];
+        let mut with_clock = six.to_vec();
+        with_clock.extend([Metric::Time, Metric::Date]);
+        // The clock line makes the band taller, so it reaches higher up the picture.
+        let plain = overlay(&sample(), &six, Position::Bottom);
+        let clocked = overlay(&sample(), &with_clock, Position::Bottom);
+        assert_eq!(plain.get_pixel(360, 400)[3], 0);
+        assert!(clocked.get_pixel(360, 400)[3] > 0);
     }
 
     #[test]

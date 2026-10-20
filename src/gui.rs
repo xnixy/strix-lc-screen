@@ -1540,9 +1540,8 @@ impl App {
                 }
             });
             ui.label(dim(&format!(
-                "Up to {} readings plus the time and date. A photo or video shows the first {}.",
-                stats_panel::MAX_TILES,
-                stats_panel::MAX_ON_PICTURE
+                "Up to {} readings, plus the time and date on a line of their own.",
+                stats_panel::MAX_TILES.min(stats_panel::MAX_ON_PICTURE)
             )));
             ui.add_space(4.0);
             let readings = self.stats.readings();
