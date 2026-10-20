@@ -4,9 +4,13 @@ A small app for the ROG Strix LC IV / SLC IV pump screen (USB 0B05:1DE7). It tal
 
 - strix-lc-screen-windows-x86_64.zip. Unzip it and run strix-lc-screen.exe. Keep ffmpeg.exe in that folder.
 - strix-lc-screen-linux-x86_64.tar.gz. The program, ffmpeg, and a udev rule.
-- strix-lc-screen_0.2.0_amd64.deb for Debian and Ubuntu.
+- strix-lc-screen_{{version}}_amd64.deb for Debian and Ubuntu.
 
 The package installs the program and the USB permission. After it is installed, unplug the cooler and plug it back in, then run strix-lc-screen. The tarball has the same program, plus ffmpeg and the udev rule, if you would rather not use the package. Copy that rule, reload udev, and unplug the cooler once.
+
+New in 0.2.1:
+
+- The time and date show on the stats band over a photo or video. They get their own line, so all 6 readings still fit.
 
 New in 0.2.0:
 
