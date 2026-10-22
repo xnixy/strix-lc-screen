@@ -37,6 +37,11 @@ const FRAME_STALL: Duration = Duration::from_secs(1);
 /// not enough and 7 s always is.
 const RESET_QUIET: Duration = Duration::from_secs(6);
 
+/// How long a command waits for its reply.
+const REPLY_WAIT: Duration = Duration::from_secs(2);
+/// Data bytes in one 1025-byte report, for pictures and files alike.
+const CHUNK: usize = 1000;
+
 impl Panel {
     pub fn open() -> Result<Self> {
         let api = HidApi::new().context("HID library failed to start")?;
@@ -156,6 +161,80 @@ impl Panel {
         self.transport_jpeg(jpeg, cancel)
     }
 
+    /// Send a firmware package and have the pump install it. This repeats what
+    /// the ASUS app did in a logged V1.0.5 to V1.0.6 update on this model:
+    ///
+    /// 1. Frames stop, and about a second passes.
+    /// 2. `transport` names the file. The pump answers 200 and from then on
+    ///    treats every report as file data, not commands.
+    /// 3. All blocks go back to back: 0x5C reports with the block count and
+    ///    index, flag 0, and up to 1000 bytes each. Only the last is answered,
+    ///    with AckNumber 0.
+    /// 4. `transported` closes the file. The pump unpacks it and restarts
+    ///    about ten seconds later, so this handle stops working.
+    ///
+    /// Nothing is retried. A stopped transfer is dropped by the pump, which
+    /// installs nothing until `transported` arrives.
+    pub fn install_firmware(&mut self, package: &[u8]) -> Result<()> {
+        const QUIET: Duration = Duration::from_millis(1500);
+        if package.is_empty() {
+            bail!("the firmware package is empty");
+        }
+        let blocks = package.len().div_ceil(CHUNK);
+        let Ok(blocks) = u16::try_from(blocks) else {
+            bail!("the firmware package is too large");
+        };
+        while self.last_write.elapsed() < QUIET {
+            std::thread::sleep(QUIET - self.last_write.elapsed());
+        }
+        // Key order and file name as the ASUS app sends them.
+        let body = format!(
+            r#"{{"type":"firmware","fileSize":{},"fileName":"update.zip"}}"#,
+            package.len()
+        );
+        let response =
+            self.call_within("transport", Some(body.as_bytes()), Duration::from_secs(10))?;
+        expect_ok(&response, "transport")?;
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| (elapsed.as_secs() & 0xff) as u8)
+            .unwrap_or(1);
+        for (index, chunk) in package.chunks(CHUNK).enumerate() {
+            fill_block(&mut self.report, id, blocks, index as u16, 0, chunk);
+            let wrote = match self.device.write(&self.report) {
+                Ok(wrote) => wrote,
+                Err(error) => {
+                    self.io_failed = true;
+                    return Err(error).context(format!(
+                        "the firmware transfer stopped at block {} of {blocks}. Nothing was installed",
+                        index + 1
+                    ));
+                }
+            };
+            self.last_write = Instant::now();
+            if wrote < self.report.len() {
+                self.io_failed = true;
+                bail!(
+                    "the firmware transfer stopped at block {} of {blocks}. Nothing was installed",
+                    index + 1
+                );
+            }
+        }
+        // The pump numbers this one reply 0.
+        let response = self.read_reply("transport", "0", Duration::from_secs(10))?;
+        expect_ok(&response, "transport")?;
+        let response = self.call_within(
+            "transported",
+            // The pump stores the md5 without checking it. The ASUS app sends "todo".
+            Some(br#"{"md5":"todo","fileName":"update.zip"}"#),
+            Duration::from_secs(6),
+        )?;
+        expect_ok(&response, "transported")?;
+        // The pump is about to restart. The next request opens a new handle.
+        self.io_failed = true;
+        Ok(())
+    }
+
     /// Push the next video frame without repeating the wake and channel setup.
     pub fn push_jpeg(&mut self, jpeg: &[u8], cancel: &dyn Fn() -> bool) -> Result<()> {
         self.transport_jpeg(jpeg, cancel)
@@ -165,7 +244,6 @@ impl Panel {
         // One 1025-byte report per slice: report id 0x00, tag 0x5C, big-endian
         // value length, a 21-byte header, then up to 1000 JPEG bytes.
         // Header: id, block count, zero-based index, flag 1, then 15 zero bytes.
-        const CHUNK: usize = 1000;
         let blocks = jpeg.len().div_ceil(CHUNK).max(1) as u16;
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -184,19 +262,7 @@ impl Panel {
             }
             let end = (offset + CHUNK).min(jpeg.len());
             let chunk = &jpeg[offset..end];
-            if self.report.len() != 1025 {
-                self.report.resize(1025, 0);
-            }
-            self.report.fill(0);
-            let value_len = (21 + chunk.len()) as u16;
-            self.report[0] = 0x00;
-            self.report[1] = 0x5c;
-            self.report[2..4].copy_from_slice(&value_len.to_be_bytes());
-            self.report[4] = id;
-            self.report[5..7].copy_from_slice(&blocks.to_be_bytes());
-            self.report[7..9].copy_from_slice(&index.to_be_bytes());
-            self.report[9] = 0x01;
-            self.report[25..25 + chunk.len()].copy_from_slice(chunk);
+            fill_block(&mut self.report, id, blocks, index, 1, chunk);
             let wrote = match self.device.write(&self.report) {
                 Ok(wrote) => wrote,
                 Err(error) => {
@@ -215,6 +281,15 @@ impl Panel {
     }
 
     fn call(&mut self, cmd: &str, body: Option<&[u8]>) -> Result<Response> {
+        self.call_within(cmd, body, REPLY_WAIT)
+    }
+
+    fn call_within(
+        &mut self,
+        cmd: &str,
+        body: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<Response> {
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
         let date = SystemTime::now()
@@ -222,10 +297,16 @@ impl Panel {
             .context("system clock is before the unix epoch")?
             .as_millis();
         let payload = msg::request(cmd, seq, date, body);
-        self.exchange(cmd, seq, &payload)
+        self.exchange(cmd, seq, &payload, timeout)
     }
 
-    fn exchange(&mut self, cmd: &str, seq: u32, payload: &[u8]) -> Result<Response> {
+    fn exchange(
+        &mut self,
+        cmd: &str,
+        seq: u32,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Response> {
         let wire = frame::encode(payload);
         let mut report = Vec::with_capacity(wire.len() + 1);
         report.push(0x00);
@@ -241,9 +322,13 @@ impl Panel {
         if wrote < report.len() {
             bail!("{cmd} wrote {wrote} of {} bytes", report.len());
         }
-
         let expected_ack = seq.wrapping_add(1).to_string();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        self.read_reply(cmd, &expected_ack, timeout)
+    }
+
+    /// Wait for the reply whose AckNumber is `expected_ack`.
+    fn read_reply(&mut self, cmd: &str, expected_ack: &str, timeout: Duration) -> Result<Response> {
+        let deadline = Instant::now() + timeout;
         let mut pending = Vec::new();
         while Instant::now() < deadline {
             let mut buf = vec![0u8; 64 * 1024];
@@ -266,7 +351,7 @@ impl Panel {
                     pending.drain(..used);
                     let response = msg::parse_response(&frame.payload)
                         .with_context(|| format!("{cmd} response was not a text message"))?;
-                    if response.header("AckNumber") != Some(expected_ack.as_str()) {
+                    if response.header("AckNumber") != Some(expected_ack) {
                         continue;
                     }
                     return Ok(response);
@@ -275,7 +360,10 @@ impl Panel {
                 Err(error) => return Err(error).context(format!("{cmd} returned a bad frame")),
             }
         }
-        bail!("{cmd} got no matching reply within 2 seconds")
+        bail!(
+            "{cmd} got no matching reply within {} seconds",
+            timeout.as_secs()
+        )
     }
 }
 
@@ -337,6 +425,21 @@ fn find_screen(api: &HidApi) -> Result<DeviceInfo> {
         .ok_or_else(|| anyhow!("no ROG Strix LC IV screen found (USB 0B05:1DE7 interface 0)"))
 }
 
+/// One 1025-byte report: report id 0x00, tag 0x5C, big-endian value length,
+/// a 21-byte header (id, block count, zero-based index, flag, then zeros), and
+/// up to 1000 data bytes. Live frames use flag 1 and files flag 0.
+fn fill_block(report: &mut Vec<u8>, id: u8, blocks: u16, index: u16, flag: u8, data: &[u8]) {
+    report.resize(1025, 0);
+    report.fill(0);
+    report[1] = 0x5c;
+    report[2..4].copy_from_slice(&((21 + data.len()) as u16).to_be_bytes());
+    report[4] = id;
+    report[5..7].copy_from_slice(&blocks.to_be_bytes());
+    report[7..9].copy_from_slice(&index.to_be_bytes());
+    report[9] = flag;
+    report[25..25 + data.len()].copy_from_slice(data);
+}
+
 fn expect_ok(response: &Response, cmd: &str) -> Result<()> {
     if response.code == 200 {
         return Ok(());
@@ -348,6 +451,25 @@ fn expect_ok(response: &Response, cmd: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_blocks_match_the_logged_asus_update() {
+        // The last of 612 blocks of the 611,852-byte V1.0.6 package, as the
+        // ASUS app logged it: 5c 0369 21 0264 0263 00 ..., then the data.
+        let data = [0xffu8, 0x61, 0x86, 0x56];
+        let mut report = Vec::new();
+        let tail = vec![0u8; 611_852 - 611 * CHUNK];
+        fill_block(&mut report, 0x21, 612, 611, 0, &tail);
+        assert_eq!(report.len(), 1025);
+        assert_eq!(
+            &report[..10],
+            &[0x00, 0x5c, 0x03, 0x69, 0x21, 0x02, 0x64, 0x02, 0x63, 0x00]
+        );
+        assert!(report[10..25].iter().all(|byte| *byte == 0));
+        fill_block(&mut report, 0x21, 612, 611, 0, &data);
+        assert_eq!(&report[25..29], &data);
+        assert!(report[29..].iter().all(|byte| *byte == 0));
+    }
 
     #[test]
     fn settings_use_the_firmware_command_names_and_keys() {

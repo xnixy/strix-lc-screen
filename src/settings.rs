@@ -1,6 +1,6 @@
 //! Saved options and the sign-in startup entry.
 
-use crate::panel::Position;
+use crate::layout::{self, Background, Layout};
 use crate::stats::Metric;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -29,12 +29,21 @@ pub struct Settings {
     pub sleep_when_locked: bool,
     /// What the pump shows when the app starts.
     pub source: Source,
-    /// Readings on the stats panel, in the order they were picked. Uses a new
-    /// field name: older builds stored firmware overlay names in `overlay_items`.
+    /// Readings picked in 0.2.x. Only read, to lay out the widgets the first
+    /// time. Older builds stored firmware overlay names in `overlay_items`.
+    #[serde(skip_serializing)]
     pub stats_items: Vec<Metric>,
-    /// Draw the stats panel over the photo or video.
+    /// Draw the widgets over the photo or video.
     pub stats_on_picture: bool,
-    pub stats_position: Position,
+    /// "top" or "bottom" in 0.2.x. Only read, like `stats_items`.
+    #[serde(skip_serializing)]
+    pub stats_position: String,
+    /// The stats dashboard. Laid out from `stats_items` when missing.
+    pub dashboard_layout: Option<Layout>,
+    /// Widgets over the photo or video. Laid out from `stats_items` when missing.
+    pub picture_layout: Option<Layout>,
+    /// Temperatures in °F instead of °C.
+    pub fahrenheit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +83,10 @@ impl Default for Settings {
                 Metric::NetDown,
             ],
             stats_on_picture: false,
-            stats_position: Position::Bottom,
+            stats_position: String::new(),
+            dashboard_layout: None,
+            picture_layout: None,
+            fahrenheit: false,
         }
     }
 }
@@ -82,10 +94,30 @@ impl Default for Settings {
 impl Settings {
     pub fn load() -> Self {
         let path = settings_path();
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Self::default();
-        };
-        serde_json::from_slice(&bytes).unwrap_or_default()
+        let mut settings: Self = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        settings.fill_layouts();
+        settings
+    }
+
+    /// Lay out the readings picked before widgets could be moved, the way they were drawn.
+    pub fn fill_layouts(&mut self) {
+        if self.dashboard_layout.is_none() {
+            self.dashboard_layout = Some(layout::arrange_dashboard(
+                &self.stats_items,
+                Background::default(),
+            ));
+        }
+        if self.picture_layout.is_none() {
+            let at_top = self.stats_position == "top";
+            self.picture_layout = Some(layout::arrange_band(&self.stats_items, at_top));
+        }
+    }
+
+    pub fn dashboard(&mut self) -> &mut Layout {
+        self.dashboard_layout.get_or_insert_with(Layout::default)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -317,6 +349,26 @@ mod tests {
         assert_eq!(settings.speed, 1.25);
         assert!(settings.sleep_when_locked);
         assert!(!settings.stats_items.is_empty());
+    }
+
+    #[test]
+    fn readings_picked_in_0_2_become_widgets_where_they_were() {
+        let previous = r#"{"stats_items":["cpu_usage","gpu_temp","time"],
+            "stats_on_picture":true,"stats_position":"top"}"#;
+        let mut settings: Settings = serde_json::from_str(previous).unwrap();
+        settings.fill_layouts();
+        let band = &settings.picture_layout.as_ref().unwrap().widgets;
+        assert_eq!(band.len(), 3);
+        assert!(
+            band.iter().all(|widget| widget.y < 360.0),
+            "band stays on top"
+        );
+        let tiles = &settings.dashboard_layout.as_ref().unwrap().widgets;
+        assert_eq!(tiles.len(), 3);
+        // Saving drops the old fields, so the layouts win from then on.
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(!saved.contains("stats_items"));
+        assert!(saved.contains("dashboard_layout"));
     }
 
     #[test]

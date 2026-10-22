@@ -1,9 +1,11 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod firmware;
 mod frame;
 mod gpu;
 mod gui;
 mod hwinfo;
+mod layout;
 mod lock;
 mod media;
 mod msg;
@@ -12,6 +14,7 @@ mod sensors;
 mod session;
 mod settings;
 mod stats;
+mod theme;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};

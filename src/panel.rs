@@ -1,32 +1,26 @@
-//! The stats panel: drawn on this computer and sent to the pump as part of the
-//! picture, the way the ASUS app does it. Either a band over the user's photo
-//! or video, or a full dashboard on its own background.
+//! The stats widgets: drawn on this computer and sent to the pump as part of
+//! the picture, the way the ASUS app does it. Either over the user's photo or
+//! video, or as a full dashboard on its own background.
 
+use crate::layout::{Backdrop, Background, Layout, Style, Widget};
 use crate::stats::{self, Metric, Readings, Sampler};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use image::{Rgb, RgbImage, Rgba, RgbaImage};
-use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 pub const SIZE: u32 = 720;
-/// The band over a picture holds up to this many readings.
-pub const MAX_ON_PICTURE: usize = 6;
-/// The dashboard holds this many tiles, plus the time and date header.
-pub const MAX_TILES: usize = 6;
 
 const WHITE: Rgba<u8> = Rgba([255, 255, 255, 255]);
 const MUTED: Rgba<u8> = Rgba([178, 172, 184, 255]);
-const ACCENT: Rgba<u8> = Rgba([232, 44, 72, 255]);
 const TRACK: Rgba<u8> = Rgba([255, 255, 255, 38]);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Position {
-    Top,
-    #[default]
-    Bottom,
-}
+/// Behind a widget with a backdrop.
+const SHADE: Rgba<u8> = Rgba([8, 6, 12, 190]);
+/// A tile without a backdrop.
+const FROST: Rgba<u8> = Rgba([255, 255, 255, 16]);
+/// Gauges open at the bottom: they start at the lower left and sweep 270°.
+const GAUGE_START: f32 = 135.0;
+const GAUGE_SWEEP: f32 = 270.0;
 
 fn fonts() -> &'static (FontRef<'static>, FontRef<'static>) {
     static FONTS: OnceLock<(FontRef<'static>, FontRef<'static>)> = OnceLock::new();
@@ -39,360 +33,328 @@ fn fonts() -> &'static (FontRef<'static>, FontRef<'static>) {
     })
 }
 
-/// A band of readings over a transparent canvas, for a photo or video. The
-/// time and date get their own line on top and do not use up reading slots.
-pub fn overlay(readings: &Readings, items: &[Metric], position: Position) -> RgbaImage {
+/// Widgets on a transparent canvas, to lay over a photo or video.
+pub fn overlay(readings: &Readings, widgets: &[Widget]) -> RgbaImage {
     let mut canvas = RgbaImage::new(SIZE, SIZE);
-    let clock: Vec<Metric> = items
-        .iter()
-        .copied()
-        .filter(|metric| matches!(metric, Metric::Time | Metric::Date))
-        .collect();
-    let items: Vec<Metric> = items
-        .iter()
-        .copied()
-        .filter(|metric| !clock.contains(metric))
-        .take(MAX_ON_PICTURE)
-        .collect();
-    if items.is_empty() && clock.is_empty() {
-        return canvas;
-    }
-    let columns = items.len().clamp(1, 3);
-    let rows = items.len().div_ceil(3);
-    let margin = 22.0;
-    let row_height = 118.0;
-    let clock_height = if clock.is_empty() { 0.0 } else { 62.0 };
-    let height = clock_height
-        + if rows > 0 {
-            row_height * rows as f32 + 20.0
-        } else {
-            10.0
-        };
-    let top = match position {
-        Position::Top => margin,
-        Position::Bottom => SIZE as f32 - margin - height,
-    };
-    let (left, right) = (margin, SIZE as f32 - margin);
-    fill_rounded(
-        &mut canvas,
-        left,
-        top,
-        right,
-        top + height,
-        22.0,
-        Rgba([8, 6, 12, 190]),
-    );
-    if !clock.is_empty() {
-        clock_line(&mut canvas, readings, &clock, top + 50.0);
-    }
-    let top = top + clock_height;
-    let cell_width = (right - left - 20.0) / columns as f32;
-    for (index, metric) in items.iter().enumerate() {
-        let (row, column) = (index / 3, index % 3);
-        // A short last row is centered.
-        let in_row = if row == rows - 1 {
-            items.len() - row * 3
-        } else {
-            columns
-        };
-        let offset = (columns - in_row) as f32 * cell_width / 2.0;
-        let x0 = left + 10.0 + offset + column as f32 * cell_width;
-        let y0 = top + 10.0 + row as f32 * row_height;
-        reading_cell(
-            &mut canvas,
-            readings,
-            *metric,
-            x0,
-            y0,
-            cell_width,
-            row_height,
-        );
-    }
+    draw_widgets(&mut canvas, readings, widgets);
     canvas
 }
 
-/// "19:45  MON 19 OCT", centered, with the time larger than the date.
-fn clock_line(canvas: &mut RgbaImage, readings: &Readings, clock: &[Metric], baseline: f32) {
-    let (bold, semi) = fonts();
-    let time = clock
-        .contains(&Metric::Time)
-        .then(|| readings.text(Metric::Time));
-    let date = clock
-        .contains(&Metric::Date)
-        .then(|| readings.text(Metric::Date));
-    let (time_size, date_size, gap) = (44.0, 30.0, 18.0);
-    let time_width = time
-        .as_deref()
-        .map_or(0.0, |text| measure(bold, time_size, text));
-    let date_width = date
-        .as_deref()
-        .map_or(0.0, |text| measure(semi, date_size, text));
-    let gap = if time.is_some() && date.is_some() {
-        gap
-    } else {
-        0.0
-    };
-    let mut x = (SIZE as f32 - time_width - gap - date_width) / 2.0;
-    if let Some(time) = &time {
-        text(
-            canvas,
-            bold,
-            time_size,
-            x,
-            baseline,
-            time,
-            WHITE,
-            Align::Left,
-            400.0,
-        );
-        x += time_width + gap;
-    }
-    if let Some(date) = &date {
-        text(
-            canvas,
-            semi,
-            date_size,
-            x,
-            baseline,
-            date,
-            MUTED,
-            Align::Left,
-            400.0,
-        );
-    }
-}
-
-fn reading_cell(
-    canvas: &mut RgbaImage,
-    readings: &Readings,
-    metric: Metric,
-    x0: f32,
-    y0: f32,
-    width: f32,
-    height: f32,
-) {
-    let (bold, semi) = fonts();
-    let center = x0 + width / 2.0;
-    let inner = width - 24.0;
-    text(
-        canvas,
-        semi,
-        24.0,
-        center,
-        y0 + 32.0,
-        metric.label(),
-        MUTED,
-        Align::Center,
-        inner,
-    );
-    let value = readings.text(metric);
-    text(
-        canvas,
-        bold,
-        50.0,
-        center,
-        y0 + 80.0,
-        &value,
-        WHITE,
-        Align::Center,
-        inner,
-    );
-    if let Some(fraction) = readings.fraction(metric) {
-        let bar_width = (inner * 0.7).min(140.0);
-        let bx = center - bar_width / 2.0;
-        let by = y0 + height - 26.0;
-        bar(canvas, bx, by, bar_width, 5.0, fraction);
-    }
-}
-
-/// A full-screen dashboard with the time on top and tiles below.
-pub fn dashboard(readings: &Readings, items: &[Metric]) -> RgbImage {
-    let mut canvas = RgbaImage::from_fn(SIZE, SIZE, background);
-    corner_marks(&mut canvas);
-    let (bold, semi) = fonts();
-    let show_time = items.contains(&Metric::Time);
-    let show_date = items.contains(&Metric::Date);
-    let tiles: Vec<Metric> = items
-        .iter()
-        .copied()
-        .filter(|metric| !matches!(metric, Metric::Time | Metric::Date))
-        .take(MAX_TILES)
-        .collect();
-
-    let (time_size, date_size) = if tiles.is_empty() {
-        (190.0, 52.0)
-    } else {
-        (120.0, 36.0)
-    };
-    // With nothing below it, the clock sits in the middle of the screen.
-    let mut y = if tiles.is_empty() {
-        let height = if show_time { time_size * 0.86 } else { 0.0 }
-            + if show_date { date_size + 18.0 } else { 0.0 };
-        (SIZE as f32 - height) / 2.0
-    } else {
-        56.0
-    };
-    if show_time {
-        let size = time_size;
-        text(
-            &mut canvas,
-            bold,
-            size,
-            360.0,
-            y + size * 0.78,
-            &readings.text(Metric::Time),
-            WHITE,
-            Align::Center,
-            640.0,
-        );
-        y += size * 0.86;
-    }
-    if show_date {
-        let size = date_size;
-        text(
-            &mut canvas,
-            semi,
-            size,
-            360.0,
-            y + size,
-            &readings.text(Metric::Date),
-            MUTED,
-            Align::Center,
-            640.0,
-        );
-        y += size + 18.0;
-    }
-    if show_time || show_date {
-        y += 14.0;
-    } else {
-        y = 48.0;
-    }
-    if tiles.is_empty() {
-        return flatten(&canvas);
-    }
-
-    let (left, right, bottom) = (40.0, SIZE as f32 - 40.0, SIZE as f32 - 40.0);
-    let gap = 16.0;
-    let rows = tiles.len().div_ceil(2);
-    let tile_height = ((bottom - y - gap * (rows as f32 - 1.0)) / rows as f32).min(170.0);
-    let used = tile_height * rows as f32 + gap * (rows as f32 - 1.0);
-    let y = y + ((bottom - y) - used) / 2.0;
-    for (index, metric) in tiles.iter().enumerate() {
-        let (row, column) = (index / 2, index % 2);
-        // An odd last tile takes the whole row.
-        let wide = tiles.len() % 2 == 1 && index == tiles.len() - 1;
-        let width = if wide {
-            right - left
-        } else {
-            (right - left - gap) / 2.0
-        };
-        let x0 = left + column as f32 * (width + gap);
-        let y0 = y + row as f32 * (tile_height + gap);
-        tile(&mut canvas, readings, *metric, x0, y0, width, tile_height);
-    }
+/// A full-screen dashboard: the background with the widgets on it.
+pub fn dashboard(readings: &Readings, layout: &Layout, background: &RgbaImage) -> RgbImage {
+    let mut canvas = background.clone();
+    draw_widgets(&mut canvas, readings, &layout.widgets);
     flatten(&canvas)
 }
 
-fn tile(
-    canvas: &mut RgbaImage,
-    readings: &Readings,
-    metric: Metric,
-    x0: f32,
-    y0: f32,
-    width: f32,
-    height: f32,
-) {
+/// Later widgets are drawn over earlier ones.
+pub fn draw_widgets(canvas: &mut RgbaImage, readings: &Readings, widgets: &[Widget]) {
+    for widget in widgets {
+        match widget.style {
+            Style::Text => text_widget(canvas, readings, widget),
+            Style::Tile => tile_widget(canvas, readings, widget),
+            Style::Ring => ring_widget(canvas, readings, widget),
+            Style::Bar => bar_widget(canvas, readings, widget),
+        }
+    }
+}
+
+fn color_of(widget: &Widget) -> Rgba<u8> {
+    let [r, g, b] = widget.color;
+    Rgba([r, g, b, 255])
+}
+
+/// The value's color. The clock reads best in plain white and grey.
+fn value_color(metric: Metric) -> Rgba<u8> {
+    if metric == Metric::Date {
+        MUTED
+    } else {
+        WHITE
+    }
+}
+
+/// The name over a large value, both centered.
+fn text_widget(canvas: &mut RgbaImage, readings: &Readings, widget: &Widget) {
     let (bold, semi) = fonts();
+    let (x0, y0, w, h) = (widget.x, widget.y, widget.w, widget.h);
+    if widget.backdrop {
+        let radius = (h * 0.22).min(24.0);
+        fill_rounded(canvas, x0, y0, x0 + w, y0 + h, radius, SHADE);
+    }
+    let pad = (w * 0.06).min(16.0);
+    let inner = w - pad * 2.0;
+    let center = x0 + w / 2.0;
+    let value = readings.text(widget.metric);
+    if widget.caption {
+        let caption_size = h * 0.2;
+        let value_size = h * 0.44;
+        let gap = h * 0.08;
+        let block = caption_size * 0.7 + gap + value_size * 0.7;
+        let caption_baseline = y0 + (h - block) / 2.0 + caption_size * 0.7;
+        text(
+            canvas,
+            semi,
+            caption_size,
+            center,
+            caption_baseline,
+            widget.metric.label(),
+            color_of(widget),
+            Align::Center,
+            inner,
+        );
+        text(
+            canvas,
+            bold,
+            value_size,
+            center,
+            caption_baseline + gap + value_size * 0.7,
+            &value,
+            value_color(widget.metric),
+            Align::Center,
+            inner,
+        );
+    } else {
+        let size = h * 0.72;
+        let font = if widget.metric == Metric::Date {
+            semi
+        } else {
+            bold
+        };
+        text(
+            canvas,
+            font,
+            size,
+            center,
+            y0 + h / 2.0 + size * 0.35,
+            &value,
+            value_color(widget.metric),
+            Align::Center,
+            inner,
+        );
+    }
+}
+
+/// A card with a colored edge, the name and value on the left, and a bar along the bottom.
+fn tile_widget(canvas: &mut RgbaImage, readings: &Readings, widget: &Widget) {
+    let (bold, semi) = fonts();
+    let (x0, y0, w, h) = (widget.x, widget.y, widget.w, widget.h);
+    let fill = if widget.backdrop { SHADE } else { FROST };
+    fill_rounded(canvas, x0, y0, x0 + w, y0 + h, (h * 0.12).min(18.0), fill);
+    let color = color_of(widget);
     fill_rounded(
         canvas,
         x0,
-        y0,
-        x0 + width,
-        y0 + height,
-        18.0,
-        Rgba([255, 255, 255, 16]),
+        y0 + h * 0.14,
+        x0 + 5.0,
+        y0 + h * 0.32,
+        2.5,
+        color,
     );
-    fill_rounded(canvas, x0, y0 + 18.0, x0 + 5.0, y0 + 50.0, 2.5, ACCENT);
-    let scale = (height / 170.0).clamp(0.6, 1.0);
-    let pad = 22.0;
-    text(
-        canvas,
-        semi,
-        28.0 * scale,
-        x0 + pad,
-        y0 + 44.0 * scale,
-        metric.label(),
-        MUTED,
-        Align::Left,
-        width - pad * 2.0,
-    );
+    let scale = (h / 170.0).clamp(0.3, 3.0);
+    let pad = 22.0 * scale.min(1.0);
+    let inner = w - pad * 2.0;
+    let fraction = readings.fraction(widget.metric);
+    if widget.caption {
+        text(
+            canvas,
+            semi,
+            28.0 * scale,
+            x0 + pad,
+            y0 + 44.0 * scale,
+            widget.metric.label(),
+            MUTED,
+            Align::Left,
+            inner,
+        );
+    }
     let value_size = 74.0 * scale;
-    let baseline = y0 + height * 0.5 + value_size * 0.42;
+    let baseline = if widget.caption {
+        y0 + h * 0.5 + value_size * 0.42
+    } else if fraction.is_some() {
+        y0 + h * 0.45 + value_size * 0.35
+    } else {
+        y0 + h * 0.5 + value_size * 0.35
+    };
     text(
         canvas,
         bold,
         value_size,
         x0 + pad,
         baseline,
-        &readings.text(metric),
-        WHITE,
+        &readings.text(widget.metric),
+        value_color(widget.metric),
         Align::Left,
-        width - pad * 2.0,
+        inner,
     );
-    if let Some(fraction) = readings.fraction(metric) {
+    if let Some(fraction) = fraction {
+        let thickness = (6.0 * scale).max(3.0);
         bar(
             canvas,
             x0 + pad,
-            y0 + height - 26.0 * scale,
-            width - pad * 2.0,
-            6.0,
+            y0 + h - 26.0 * scale,
+            inner,
+            thickness,
             fraction,
+            color,
         );
     }
 }
 
-/// Near-black with a red glow in the lower right, like the ASUS backgrounds.
-fn background(x: u32, y: u32) -> Rgba<u8> {
-    let (dx, dy) = (x as f32 - 560.0, y as f32 - 600.0);
-    let glow = (1.0 - (dx * dx + dy * dy).sqrt() / 620.0)
-        .clamp(0.0, 1.0)
-        .powf(1.6);
-    let channel = |base: f32, lift: f32| (base + lift * glow).round() as u8;
-    Rgba([
-        channel(10.0, 70.0),
-        channel(8.0, 6.0),
-        channel(13.0, 20.0),
-        255,
-    ])
-}
-
-fn corner_marks(canvas: &mut RgbaImage) {
-    let color = Rgba([255, 255, 255, 60]);
-    let (near, far, length, thickness) = (18.0, SIZE as f32 - 18.0, 46.0, 3.0);
-    for (x, y, dx, dy) in [
-        (near, near, 1.0, 1.0),
-        (far, near, -1.0, 1.0),
-        (near, far, 1.0, -1.0),
-        (far, far, -1.0, -1.0),
-    ] {
-        let (x1, x2) = order(x, x + dx * length);
-        let (y1, y2) = order(y, y + dy * thickness);
-        fill_rounded(canvas, x1, y1, x2, y2, 1.0, color);
-        let (x1, x2) = order(x, x + dx * thickness);
-        let (y1, y2) = order(y, y + dy * length);
-        fill_rounded(canvas, x1, y1, x2, y2, 1.0, color);
+/// A round gauge with the value in the middle and the name in the opening at the bottom.
+fn ring_widget(canvas: &mut RgbaImage, readings: &Readings, widget: &Widget) {
+    let (bold, semi) = fonts();
+    let side = widget.w.min(widget.h);
+    let (cx, cy) = widget.center();
+    if widget.backdrop {
+        fill_rounded(
+            canvas,
+            cx - side / 2.0,
+            cy - side / 2.0,
+            cx + side / 2.0,
+            cy + side / 2.0,
+            side / 2.0,
+            SHADE,
+        );
+    }
+    let thickness = side * 0.075;
+    let radius = side / 2.0 - thickness / 2.0 - side * 0.05;
+    arc(
+        canvas,
+        cx,
+        cy,
+        radius,
+        thickness,
+        GAUGE_START,
+        GAUGE_SWEEP,
+        TRACK,
+    );
+    if let Some(fraction) = readings.fraction(widget.metric) {
+        let sweep = GAUGE_SWEEP * fraction as f32;
+        if sweep > 0.5 {
+            arc(
+                canvas,
+                cx,
+                cy,
+                radius,
+                thickness,
+                GAUGE_START,
+                sweep,
+                color_of(widget),
+            );
+        }
+    }
+    let inner = radius * 1.5;
+    let value_size = side * 0.21;
+    text(
+        canvas,
+        bold,
+        value_size,
+        cx,
+        cy + value_size * 0.3,
+        &readings.text(widget.metric),
+        value_color(widget.metric),
+        Align::Center,
+        inner,
+    );
+    if widget.caption {
+        text(
+            canvas,
+            semi,
+            side * 0.1,
+            cx,
+            cy + radius * 0.82,
+            widget.metric.label(),
+            MUTED,
+            Align::Center,
+            radius,
+        );
     }
 }
 
-fn order(a: f32, b: f32) -> (f32, f32) {
-    if a <= b {
-        (a, b)
+/// The name on the left and the value on the right, over a bar the width of the widget.
+fn bar_widget(canvas: &mut RgbaImage, readings: &Readings, widget: &Widget) {
+    let (bold, semi) = fonts();
+    let (x0, y0, w, h) = (widget.x, widget.y, widget.w, widget.h);
+    if widget.backdrop {
+        fill_rounded(canvas, x0, y0, x0 + w, y0 + h, (h * 0.2).min(20.0), SHADE);
+    }
+    let pad = if widget.backdrop {
+        (h * 0.16).min(18.0)
     } else {
-        (b, a)
+        0.0
+    };
+    let inner = w - pad * 2.0;
+    let thickness = (h * 0.13).max(4.0);
+    let value_size = h * 0.42;
+    let baseline = y0 + pad + value_size * 0.75;
+    let value = readings.text(widget.metric);
+    let value_width = if widget.caption { inner * 0.55 } else { inner };
+    text(
+        canvas,
+        bold,
+        value_size,
+        x0 + w - pad,
+        baseline,
+        &value,
+        value_color(widget.metric),
+        Align::Right,
+        value_width,
+    );
+    if widget.caption {
+        let used = measure(bold, value_size, &value).min(value_width);
+        text(
+            canvas,
+            semi,
+            h * 0.3,
+            x0 + pad,
+            baseline,
+            widget.metric.label(),
+            MUTED,
+            Align::Left,
+            (inner - used - 12.0).max(10.0),
+        );
     }
+    bar(
+        canvas,
+        x0 + pad,
+        y0 + h - pad - thickness,
+        inner,
+        thickness,
+        readings.fraction(widget.metric).unwrap_or(0.0),
+        color_of(widget),
+    );
 }
 
-fn bar(canvas: &mut RgbaImage, x: f32, y: f32, width: f32, height: f32, fraction: f64) {
+/// The dashboard's background, before any widgets.
+pub fn backdrop(background: Background) -> RgbaImage {
+    let [r, g, b] = background.color.map(f32::from);
+    RgbaImage::from_fn(SIZE, SIZE, |x, y| {
+        let (x, y) = (x as f32, y as f32);
+        let glow = match background.style {
+            Backdrop::Glow => falloff(x - 560.0, y - 600.0, 620.0, 1.6),
+            Backdrop::Spotlight => falloff(x - 360.0, y - 360.0, 520.0, 1.8) * 0.8,
+            Backdrop::Plain => 0.0,
+        };
+        let channel = |base: f32, color: f32| (base + color * 0.3 * glow).round().min(255.0) as u8;
+        Rgba([channel(10.0, r), channel(8.0, g), channel(13.0, b), 255])
+    })
+}
+
+fn falloff(dx: f32, dy: f32, reach: f32, power: f32) -> f32 {
+    (1.0 - (dx * dx + dy * dy).sqrt() / reach)
+        .clamp(0.0, 1.0)
+        .powf(power)
+}
+
+fn bar(
+    canvas: &mut RgbaImage,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    fraction: f64,
+    color: Rgba<u8>,
+) {
     let radius = height / 2.0;
     fill_rounded(canvas, x, y, x + width, y + height, radius, TRACK);
     let filled = width * fraction as f32;
@@ -404,8 +366,56 @@ fn bar(canvas: &mut RgbaImage, x: f32, y: f32, width: f32, height: f32, fraction
             x + filled.max(height),
             y + height,
             radius,
-            ACCENT,
+            color,
         );
+    }
+}
+
+/// An anti-aliased arc with round ends. Angles are in degrees, clockwise from
+/// three o'clock, as the screen's y axis points down.
+#[allow(clippy::too_many_arguments)]
+fn arc(
+    canvas: &mut RgbaImage,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    thickness: f32,
+    start: f32,
+    sweep: f32,
+    color: Rgba<u8>,
+) {
+    let half = thickness / 2.0;
+    let point = |degrees: f32| {
+        let angle = degrees.to_radians();
+        (cx + radius * angle.cos(), cy + radius * angle.sin())
+    };
+    let ends = [point(start), point(start + sweep)];
+    let reach = radius + half + 1.0;
+    let (left, right) = (
+        (cx - reach).floor().max(0.0),
+        (cx + reach).ceil().min(SIZE as f32),
+    );
+    let (top, bottom) = (
+        (cy - reach).floor().max(0.0),
+        (cy + reach).ceil().min(SIZE as f32),
+    );
+    for py in top as i32..bottom as i32 {
+        for px in left as i32..right as i32 {
+            let (x, y) = (px as f32 + 0.5, py as f32 + 0.5);
+            let (dx, dy) = (x - cx, y - cy);
+            let along = (dy.atan2(dx).to_degrees() - start).rem_euclid(360.0);
+            let distance = if along <= sweep {
+                ((dx * dx + dy * dy).sqrt() - radius).abs()
+            } else {
+                ends.iter()
+                    .map(|(ex, ey)| ((x - ex).powi(2) + (y - ey).powi(2)).sqrt())
+                    .fold(f32::MAX, f32::min)
+            };
+            let coverage = (half - distance + 0.5).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                blend(canvas, px, py, color, coverage);
+            }
+        }
     }
 }
 
@@ -413,6 +423,7 @@ fn bar(canvas: &mut RgbaImage, x: f32, y: f32, width: f32, height: f32, fraction
 enum Align {
     Left,
     Center,
+    Right,
 }
 
 /// Draw one line of text with its baseline at `baseline`. Text wider than
@@ -429,6 +440,9 @@ fn text(
     align: Align,
     max_width: f32,
 ) {
+    if size < 1.0 || max_width <= 0.0 {
+        return;
+    }
     let mut size = size;
     let mut width = measure(font, size, line);
     if width > max_width && width > 0.0 {
@@ -439,6 +453,7 @@ fn text(
     let mut pen = match align {
         Align::Left => x,
         Align::Center => x - width / 2.0,
+        Align::Right => x - width,
     };
     let mut previous = None;
     for character in line.chars() {
@@ -556,14 +571,13 @@ pub fn encode(picture: &RgbImage) -> Option<Vec<u8>> {
 /// What the panel should show. Set by the window, read by the panel thread.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
-    pub items: Vec<Metric>,
-    /// Draw the band over the user's photo or video.
-    pub on_picture: bool,
-    pub position: Position,
-    /// The dashboard is the picture.
-    pub dashboard: bool,
+    /// Widgets over the user's photo or video, while that is on the pump.
+    pub picture: Option<Vec<Widget>>,
+    /// The dashboard, while it is on the pump.
+    pub dashboard: Option<Layout>,
     /// The window is open and shows live readings.
     pub window_open: bool,
+    pub fahrenheit: bool,
 }
 
 #[derive(Clone, Default)]
@@ -597,6 +611,14 @@ impl Shared {
             .clone()
     }
 
+    fn draws_on_picture(&self) -> bool {
+        self.config
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .picture
+            .is_some()
+    }
+
     pub fn rendered(&self) -> Rendered {
         self.rendered
             .lock()
@@ -617,20 +639,34 @@ pub fn spawn(shared: Arc<Shared>) {
     thread::spawn(move || {
         let mut sampler = Sampler::default();
         let mut version = 0u64;
+        let mut background: Option<(Background, RgbaImage)> = None;
         loop {
             let config = shared.config();
-            let drawing = !config.items.is_empty() && (config.on_picture || config.dashboard);
+            let on_picture = config
+                .picture
+                .as_ref()
+                .is_some_and(|widgets| !widgets.is_empty());
+            let drawing = on_picture || config.dashboard.is_some();
             if drawing || config.window_open {
-                let readings = sampler.sample();
+                let mut readings = sampler.sample();
+                readings.fahrenheit = config.fahrenheit;
                 if drawing {
                     version += 1;
                     let overlay = config
-                        .on_picture
-                        .then(|| Arc::new(overlay(&readings, &config.items, config.position)));
-                    let dashboard = config
-                        .dashboard
-                        .then(|| encode(&dashboard(&readings, &config.items)).map(Arc::new))
-                        .flatten();
+                        .picture
+                        .as_ref()
+                        .filter(|widgets| !widgets.is_empty())
+                        .map(|widgets| Arc::new(overlay(&readings, widgets)));
+                    let dashboard = config.dashboard.as_ref().and_then(|layout| {
+                        if background
+                            .as_ref()
+                            .is_none_or(|(drawn, _)| *drawn != layout.background)
+                        {
+                            background = Some((layout.background, backdrop(layout.background)));
+                        }
+                        let (_, image) = background.as_ref()?;
+                        encode(&dashboard(&readings, layout, image)).map(Arc::new)
+                    });
                     *shared
                         .rendered
                         .lock()
@@ -668,7 +704,7 @@ impl Composer {
             return rendered.dashboard;
         }
         let overlay = rendered.overlay?;
-        if !shared.config().on_picture {
+        if !shared.draws_on_picture() {
             return None;
         }
         let key = (base.as_ptr() as usize, base.len(), rendered.version);
@@ -691,6 +727,7 @@ impl Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::{self, Widget};
 
     fn sample() -> Readings {
         let mut readings = Readings::default();
@@ -705,53 +742,79 @@ mod tests {
     }
 
     #[test]
-    fn time_and_date_do_not_take_a_reading_slot() {
-        let six = [
-            Metric::CpuUsage,
-            Metric::CpuClock,
-            Metric::GpuUsage,
-            Metric::GpuTemp,
-            Metric::MemoryUsed,
-            Metric::NetDown,
-        ];
-        let mut with_clock = six.to_vec();
-        with_clock.extend([Metric::Time, Metric::Date]);
-        // The clock line makes the band taller, so it reaches higher up the picture.
-        let plain = overlay(&sample(), &six, Position::Bottom);
-        let clocked = overlay(&sample(), &with_clock, Position::Bottom);
-        assert_eq!(plain.get_pixel(360, 400)[3], 0);
-        assert!(clocked.get_pixel(360, 400)[3] > 0);
+    fn widgets_only_paint_inside_their_box() {
+        for style in Style::ALL {
+            for backdrop in [false, true] {
+                let mut widget = Widget::new(Metric::CpuUsage, style, 360.0, 360.0);
+                widget.backdrop = backdrop;
+                let image = overlay(&sample(), &[widget.clone()]);
+                let mut painted = 0;
+                for (x, y, pixel) in image.enumerate_pixels() {
+                    if pixel[3] == 0 {
+                        continue;
+                    }
+                    painted += 1;
+                    let (x, y) = (x as f32, y as f32);
+                    assert!(
+                        x >= widget.x - 2.0
+                            && x <= widget.x + widget.w + 2.0
+                            && y >= widget.y - 2.0
+                            && y <= widget.y + widget.h + 2.0,
+                        "{style:?} painted outside its box at {x},{y}"
+                    );
+                }
+                assert!(painted > 0, "{style:?} drew nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn a_gauge_fills_with_the_reading() {
+        let mut widget = Widget::new(Metric::CpuUsage, Style::Ring, 360.0, 360.0);
+        widget.caption = false;
+        let image = overlay(&sample(), &[widget.clone()]);
+        let color = Rgba([widget.color[0], widget.color[1], widget.color[2], 255]);
+        let thickness = widget.w * 0.075;
+        let radius = widget.w / 2.0 - thickness / 2.0 - widget.w * 0.05;
+        // 37% of 270° from the lower left reaches past the left edge, not the top.
+        let at = |degrees: f32| {
+            let angle = degrees.to_radians();
+            let (cx, cy) = widget.center();
+            *image.get_pixel(
+                (cx + radius * angle.cos()) as u32,
+                (cy + radius * angle.sin()) as u32,
+            )
+        };
+        assert_eq!(at(180.0), color, "filled part");
+        assert_ne!(at(300.0), color, "empty part");
     }
 
     #[test]
     fn overlay_leaves_the_rest_of_the_picture_clear() {
-        let overlay = overlay(
-            &sample(),
-            &[Metric::CpuUsage, Metric::GpuTemp],
-            Position::Bottom,
-        );
-        assert_eq!(
-            overlay.get_pixel(360, 100)[3],
-            0,
-            "top of the picture is untouched"
-        );
-        assert!(overlay.get_pixel(360, 690)[3] > 0, "band is at the bottom");
+        let layout = layout::arrange_band(&[Metric::CpuUsage, Metric::GpuTemp], false);
+        let overlay = overlay(&sample(), &layout.widgets);
+        assert_eq!(overlay.get_pixel(360, 100)[3], 0, "top is untouched");
+        assert!(overlay.get_pixel(250, 690)[3] > 0, "band is at the bottom");
     }
 
     #[test]
-    fn dashboard_draws_every_tile_count() {
-        for count in 0..=MAX_TILES {
-            let mut items = vec![Metric::Time, Metric::Date];
-            items.extend(
-                stats::ALL
-                    .iter()
-                    .copied()
-                    .filter(|m| !matches!(m, Metric::Time | Metric::Date))
-                    .take(count),
-            );
-            let image = dashboard(&sample(), &items);
+    fn dashboard_draws_every_arrangement() {
+        for count in 0..=stats::ALL.len() {
+            let layout = layout::arrange_dashboard(&stats::ALL[..count], Background::default());
+            let image = dashboard(&sample(), &layout, &backdrop(layout.background));
             assert_eq!(image.dimensions(), (SIZE, SIZE));
         }
+    }
+
+    #[test]
+    fn plain_backdrop_has_no_glow() {
+        let plain = backdrop(Background {
+            style: Backdrop::Plain,
+            ..Background::default()
+        });
+        assert_eq!(plain.get_pixel(560, 600), plain.get_pixel(0, 0));
+        let glow = backdrop(Background::default());
+        assert!(glow.get_pixel(560, 600)[0] > glow.get_pixel(0, 0)[0]);
     }
 
     #[test]

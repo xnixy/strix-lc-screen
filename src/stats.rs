@@ -176,6 +176,8 @@ impl Value {
 pub struct Readings {
     values: HashMap<Metric, Value>,
     pub time: LocalTime,
+    /// Show temperatures in Fahrenheit. Bars still use the Celsius scale.
+    pub fahrenheit: bool,
 }
 
 const WEEKDAYS: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
@@ -227,6 +229,9 @@ impl Readings {
         match metric {
             CpuUsage | GpuUsage | MemoryUsage | DiskUsage | GpuFan => format!("{now:.0}%"),
             CpuClock | GpuClock => clock(now),
+            CpuTemp | GpuTemp | CoolantTemp if self.fahrenheit => {
+                format!("{:.0}°F", now * 9.0 / 5.0 + 32.0)
+            }
             CpuTemp | GpuTemp | CoolantTemp => format!("{now:.0}°C"),
             CpuPower | GpuPower => format!("{now:.0} W"),
             MemoryUsed | GpuMemory => match value.max {
@@ -376,6 +381,7 @@ impl Sampler {
         Readings {
             values,
             time: sensors::local_time(),
+            fahrenheit: false,
         }
     }
 }
@@ -401,6 +407,8 @@ mod tests {
         assert_eq!(readings.text(Metric::CpuUsage), "13%");
         assert_eq!(readings.text(Metric::CpuClock), "4.32 GHz");
         assert_eq!(readings.text(Metric::GpuTemp), "61°C");
+        readings.fahrenheit = true;
+        assert_eq!(readings.text(Metric::GpuTemp), "143°F");
         assert_eq!(readings.text(Metric::MemoryUsed), "19.5/64 GB");
         assert_eq!(readings.text(Metric::NetDown), "2.5 MB/s");
         assert_eq!(readings.text(Metric::NetUp), "300 KB/s");

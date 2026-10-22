@@ -4,19 +4,21 @@ A small app that drives the pump screen on a ROG Strix LC IV / SLC IV cooler. It
 
 The panel is a 720×720 screen on USB device `0B05:1DE7`. This app talks to that device directly. On Windows, quit the ASUS app first. Both programs want the same USB connection, and the official one wins if it is running.
 
-![The Pump screen window. The picture is on the left. Brightness, rotation, and startup options are on the right.](docs/pump-screen.png)
+![The Widgets page. A preview of the pump screen shows the stats dashboard, with tips and a list of readings to add on the right.](docs/pump-screen.png)
 
 ## What you can do
 
 - Set brightness, rotation (0°, 90°, 180°, 270°), and wake or sleep the screen.
-- Show a photo, or play a short video, with a crop box and a zoom slider.
+- Show a photo, a GIF, or a video of up to a minute, with a crop box and a zoom slider.
 - Change playback speed from 0.25× to 2× while the clip is running. 1× matches the length of the video.
 - Close the window and leave the clip running. A tray icon stays behind.
 - Start the app when you sign in, hidden in the tray if you want, and send the last file again on its own.
-- Show a stats panel, drawn the way the ASUS app does it: a band over your photo or video, or a full dashboard. Pick up to 6 readings plus the time and date: CPU usage and clock, GPU usage, clock, temperature, power, fan, and memory (NVIDIA cards), RAM, disk space and speed, and network speed. The app redraws it once a second, so it stops updating when the app quits.
+- Place live readings anywhere on the screen, over your photo or video or on a stats dashboard. Drag them on a preview of the pump, resize them from the corner, and pick a style for each one: text, tile, gauge, or bar, in one of ten colors. Readings: the time and date, CPU usage and clock, GPU usage, clock, temperature, power, fan, and memory (NVIDIA cards), RAM, disk space and speed, and network speed. The app redraws them once a second, so they stop updating when the app quits.
+- Give the dashboard a corner glow, a spotlight, or a plain background, and show temperatures in °C or °F.
 - Go back to the pump's own animation. It is stored in the pump, so it keeps playing after this app quits.
 - Turn the screen on or off, and choose whether it plays the standby clip while the computer sleeps. These are the same switches the ASUS app has, and the pump remembers them.
 - Put the pump screen to sleep while the computer is locked.
+- Update the pump's firmware with a package from ASUS, such as `FW_ROG_Strix_LC_IV_360_ARGB_LCD_V1.0.6.zip`. The app checks that the package is for this model, is not damaged, and is not older than the pump's firmware, then sends it the same way the ASUS app does. The pump restarts on its own afterwards.
 
 ### CPU temperature, pump, and fan speeds
 
@@ -30,7 +32,7 @@ Click the tray icon to open the window. Right-click it to stop the video or quit
 
 Custom pictures are sent as JPEG frames from this computer. The cooler does not store them. About a second after frames stop, the pump goes back to its built-in clip. This app keeps sending the current picture while it is running, including when the window is hidden in the tray. After you quit, the built-in clip comes back.
 
-Video is limited to about 20 seconds, sampled at up to 8 frames per second.
+Video is limited to 60 seconds, sampled at up to 24 frames per second.
 
 ## Downloads
 

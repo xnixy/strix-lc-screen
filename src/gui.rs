@@ -2,11 +2,11 @@
 
 use crate::lock;
 use crate::media::{self, photo_jpeg, video_jpegs, Crop};
-// `Panel` is the USB session with the screen; `stats_panel` draws the stats panel.
-use crate::panel::{self as stats_panel, Composer, Position};
+// `Panel` is the USB session with the screen; `stats_panel` draws the widgets.
+use crate::panel::{self as stats_panel, Composer};
 use crate::session::{Panel, Setting};
 use crate::settings::{self, Settings, Source};
-use crate::stats::{self, Metric};
+use crate::theme;
 use anyhow::{Context, Result};
 use eframe::egui;
 use std::path::PathBuf;
@@ -15,6 +15,18 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod editor;
+mod pages;
+
+/// The pages in the sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Page {
+    Show,
+    Widgets,
+    Screen,
+    Settings,
+}
 
 enum Request {
     Refresh(Sender<Result<Snapshot>>),
@@ -31,6 +43,8 @@ enum Request {
     Stop,
     /// The computer was locked (`true`) or unlocked.
     Locked(bool),
+    /// Install a checked firmware package. The pump restarts afterwards.
+    Firmware(Vec<u8>, Sender<Result<()>>),
 }
 
 #[derive(Clone)]
@@ -158,6 +172,9 @@ fn hold_last(play: Playing) -> Option<Playing> {
 }
 
 fn open_panel() -> Option<Panel> {
+    if demo() {
+        return None;
+    }
     Panel::open()
         .and_then(|mut panel| {
             panel.connect()?;
@@ -243,10 +260,41 @@ fn worker_loop(
                     if panel.is_none() {
                         panel = open_panel();
                     }
-                    if let Some(panel) = panel.as_mut() {
-                        let effect = lock_change(panel, locked);
-                        after_command(&mut playing, effect);
+                    let effect = match panel.as_mut() {
+                        Some(panel) => lock_change(panel, locked),
+                        // Right after the computer wakes the pump may still be
+                        // enumerating. Playback opens it once it is back.
+                        None if !locked => AfterCommand::Wake,
+                        None => AfterCommand::Keep,
+                    };
+                    after_command(&mut playing, effect);
+                }
+                Request::Firmware(package, reply) => {
+                    // No frames may go out during the transfer: the pump writes
+                    // every report it gets into the file.
+                    playing = None;
+                    cancel.store(false, Ordering::Relaxed);
+                    if panel.is_none() {
+                        panel = open_panel();
                     }
+                    let result = (|| {
+                        let panel = panel.as_mut().context("pump screen is not connected")?;
+                        let state = panel.state()?;
+                        if state["bootFinish"].as_u64() != Some(1) {
+                            anyhow::bail!("the pump is still starting up. Try again in a minute");
+                        }
+                        let free = state["space"].as_u64().unwrap_or(0) * 1024;
+                        if free < package.len() as u64 + 4 * 1024 * 1024 {
+                            anyhow::bail!(
+                                "the pump does not have enough free space for this package"
+                            );
+                        }
+                        panel.install_firmware(&package)
+                    })();
+                    // The pump restarts after a good transfer, and a failed one
+                    // may have left the handle unusable. Open a new one later.
+                    panel = None;
+                    let _ = reply.send(result);
                 }
                 Request::Animation(reply) => {
                     // The pump goes back to its animation about a second after
@@ -341,25 +389,31 @@ fn worker_loop(
             if panel.as_ref().is_some_and(Panel::io_failed) {
                 panel = None;
             }
-            // At sign-in the pump USB is often still enumerating. Keep the clip
-            // and try again. Once frames are flowing, a few failures mean it left.
-            // The screen may also have closed the live channel, so open it again.
-            let give_up = match playing.as_mut() {
-                Some(play) => {
-                    play.prepared = false;
-                    let limit = if play.delivered { 3 } else { 40 };
-                    play.retries = play.retries.saturating_add(1);
-                    if play.retries > limit {
-                        true
-                    } else {
-                        play.next_at = Instant::now() + Duration::from_millis(500);
-                        false
+            // At sign-in and after the computer wakes, the pump USB can take a
+            // while to come back, and the screen may have closed the live
+            // channel. Keep the clip and try again, slower once the quick
+            // retries run out. Giving up here left the screen on its own clip.
+            if let Some(play) = playing.as_mut() {
+                play.prepared = false;
+                let limit = if play.delivered { 3 } else { 40 };
+                play.retries = play.retries.saturating_add(1);
+                let delay = if play.retries <= limit {
+                    Duration::from_millis(500)
+                } else {
+                    if play.retries == limit + 1 {
+                        // The handle may be stale without reporting an error.
+                        panel = None;
+                    } else if panel.as_mut().is_some_and(|panel| {
+                        panel
+                            .state()
+                            .is_ok_and(|state| state["waterBlockScreen"].as_u64() == Some(0))
+                    }) {
+                        // Switched off. Turning it on again wakes playback.
+                        play.paused = true;
                     }
-                }
-                None => true,
-            };
-            if give_up {
-                playing = None;
+                    Duration::from_secs(5)
+                };
+                play.next_at = Instant::now() + delay;
             }
             continue;
         }
@@ -424,10 +478,10 @@ fn lock_change(panel: &mut Panel, locked: bool) -> AfterCommand {
     if switched_off {
         return AfterCommand::Keep;
     }
-    match panel.power("resume") {
-        Ok(()) => AfterCommand::Wake,
-        Err(_) => AfterCommand::Keep,
-    }
+    // Wake playback even if this fails. After the computer sleeps the handle is
+    // often dead, and playback opens a new one and sends resume itself.
+    let _ = panel.power("resume");
+    AfterCommand::Wake
 }
 
 /// Sleep until the next frame. A send that already ran long still waits a full
@@ -487,11 +541,19 @@ fn dispatch(panel: &mut Option<Panel>, request: Request) {
                 "the request was not handed to the pump"
             )));
         }
+        Request::Firmware(_, reply) => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "the firmware was not handed to the pump"
+            )));
+        }
         Request::Play(_, _) | Request::Stop | Request::Dashboard | Request::Locked(_) => {}
     }
 }
 
 fn snapshot(panel: &mut Option<Panel>) -> Result<Snapshot> {
+    if demo() {
+        anyhow::bail!("demo mode does not open the pump");
+    }
     if panel.is_none() {
         *panel = Some(Panel::open().and_then(|mut panel| {
             panel.connect()?;
@@ -521,19 +583,45 @@ fn read_snapshot(panel: &mut Panel) -> Result<Snapshot> {
     })
 }
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(196, 54, 78);
+/// The window's title. Windows finds the window by it.
+fn window_title() -> &'static str {
+    if demo() {
+        "Pump screen demo"
+    } else {
+        "Pump screen"
+    }
+}
+
+/// Set in debug builds by STRIX_LC_SCREEN_DEMO, to look at the window next to a
+/// running copy: no USB, no single-instance check, and its own window title.
+pub fn demo() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("STRIX_LC_SCREEN_DEMO").is_some()
+}
+
+/// The page a demo window opens on, from STRIX_LC_SCREEN_DEMO.
+fn demo_page() -> Option<Page> {
+    if !demo() {
+        return None;
+    }
+    match std::env::var("STRIX_LC_SCREEN_DEMO").ok()?.as_str() {
+        "widgets" | "picture" => Some(Page::Widgets),
+        "screen" | "firmware" => Some(Page::Screen),
+        "settings" => Some(Page::Settings),
+        _ => None,
+    }
+}
 
 pub fn run(start_in_tray: bool) -> eframe::Result<()> {
-    if !settings::claim_single_instance() {
+    if !demo() && !settings::claim_single_instance() {
         return Ok(());
     }
     let (tray_tx, tray_rx) = std::sync::mpsc::sync_channel(64);
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1000.0, 640.0])
-        .with_min_inner_size([900.0, 540.0])
+        .with_inner_size([1200.0, 780.0])
+        .with_min_inner_size([1000.0, 660.0])
         .with_resizable(true)
         .with_decorations(true)
-        .with_title("Pump screen");
+        .with_title(window_title());
     #[cfg(windows)]
     {
         viewport = viewport.with_transparent(true);
@@ -546,7 +634,7 @@ pub fn run(start_in_tray: bool) -> eframe::Result<()> {
         "Pump screen",
         options,
         Box::new(move |cc| {
-            install_theme(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx);
             let _ = apply_window_material();
             let ctx = cc.egui_ctx.clone();
             settings::on_show_request({
@@ -611,8 +699,16 @@ struct App {
     window_fitted: bool,
     /// Read by the lock watcher.
     follow_lock: Arc<AtomicBool>,
-    /// The tab shown in the Picture card. What the pump shows is `settings.source`.
+    /// The source whose controls the Show page has open. What the pump shows is `settings.source`.
     picture_tab: Source,
+    page: Page,
+    editor: editor::Editor,
+    /// Widget layouts before each change, newest last.
+    undo: Vec<(editor::Canvas, crate::layout::Layout)>,
+    /// The layout as it was when the current drag began.
+    gesture: Option<crate::layout::Layout>,
+    /// A checked firmware package waiting for the user to confirm.
+    firmware_offer: Option<crate::firmware::Package>,
     /// Shared with the stats panel thread and the screen worker.
     stats: Arc<stats_panel::Shared>,
 }
@@ -638,6 +734,7 @@ enum JobResult {
     Done(Result<()>),
     /// The worker is already playing. The UI only needs the count for its status line.
     Playing(usize),
+    Firmware(Result<()>),
     Failed(String),
 }
 
@@ -710,6 +807,27 @@ impl App {
             window_fitted: false,
             follow_lock,
             picture_tab,
+            page: demo_page().unwrap_or(Page::Show),
+            editor: {
+                let mut editor = editor::Editor::new();
+                if demo() && std::env::var("STRIX_LC_SCREEN_DEMO").as_deref() == Ok("picture") {
+                    editor.canvas = editor::Canvas::Picture;
+                }
+                editor
+            },
+            undo: Vec::new(),
+            gesture: None,
+            // A demo opened with "firmware" shows the dialog for the downloaded package.
+            firmware_offer: (demo()
+                && std::env::var("STRIX_LC_SCREEN_DEMO").as_deref() == Ok("firmware"))
+            .then(|| {
+                let home = std::env::var_os("USERPROFILE")?;
+                let path = PathBuf::from(home)
+                    .join("Downloads")
+                    .join("FW_ROG_Strix_LC_IV_360_ARGB_LCD_V1.0.6.zip");
+                crate::firmware::read(&path).ok()
+            })
+            .flatten(),
             stats,
         }
     }
@@ -844,6 +962,19 @@ impl App {
             JobResult::Failed(error) => {
                 self.status = error;
             }
+            JobResult::Firmware(result) => {
+                self.status = match result {
+                    Ok(()) => "Firmware sent. The pump is installing it and restarting. \
+                               This takes about half a minute."
+                        .into(),
+                    Err(error) => format!("Firmware was not installed: {error:#}"),
+                };
+                // Read the pump again once it is back, then show what was on it.
+                self.snapshot = None;
+                self.busy = true;
+                self.resume_when_ready = true;
+                self.pending = Some(spawn_snapshot_after_restart(&self.worker));
+            }
         }
         ctx.request_repaint();
     }
@@ -932,29 +1063,7 @@ impl eframe::App for App {
         } else if !self.in_tray {
             ctx.request_repaint_after(Duration::from_secs(3));
         }
-        egui::CentralPanel::default()
-            .frame(shell_frame())
-            .show(ctx, |ui| {
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        self.header(ui);
-                        if self.asus_running {
-                            ui.add_space(6.0);
-                            ui.colored_label(
-                                egui::Color32::from_rgb(255, 186, 110),
-                                "Quit ROG STRIX LC & SLC IV Series. It is holding the pump USB connection.",
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.columns_const(|[left, right]| {
-                            self.picture_card(left, ctx);
-                            self.controls_card(right);
-                        });
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(&self.status).size(13.5));
-                    });
-            });
+        self.draw(ctx);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -967,115 +1076,6 @@ impl eframe::App for App {
             egui::Color32::from_rgb(16, 14, 20).to_normalized_gamma_f32()
         }
     }
-}
-
-fn install_theme(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.visuals = pump_visuals();
-    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(12.0, 7.0);
-    style.spacing.interact_size.y = 30.0;
-    ctx.set_style(style);
-}
-
-fn pump_visuals() -> egui::Visuals {
-    let mut visuals = egui::Visuals::dark();
-    visuals.window_fill = egui::Color32::TRANSPARENT;
-    visuals.panel_fill = egui::Color32::TRANSPARENT;
-    visuals.faint_bg_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14);
-    visuals.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(18, 14, 20, 170);
-    visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(176, 170, 176);
-    visuals.widgets.noninteractive.bg_stroke.color =
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28);
-    let mut idle = visuals.widgets.inactive;
-    idle.bg_fill = egui::Color32::from_rgb(58, 50, 58);
-    idle.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18);
-    idle.bg_stroke = egui::Stroke::new(
-        1.0_f32,
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
-    );
-    idle.corner_radius = egui::CornerRadius::same(8);
-    idle.fg_stroke.color = egui::Color32::from_rgb(240, 236, 238);
-    let mut hovered = idle;
-    hovered.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30);
-    hovered.bg_fill = egui::Color32::from_rgb(78, 66, 74);
-    let mut active = hovered;
-    active.bg_fill = ACCENT;
-    active.weak_bg_fill = ACCENT;
-    active.fg_stroke.color = egui::Color32::WHITE;
-    visuals.widgets.inactive = idle;
-    visuals.widgets.hovered = hovered;
-    visuals.widgets.active = active;
-    visuals.widgets.open = hovered;
-    visuals.selection.bg_fill = egui::Color32::from_rgb(190, 52, 74);
-    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(230, 140, 152));
-    visuals.hyperlink_color = egui::Color32::from_rgb(255, 176, 186);
-    visuals.window_corner_radius = egui::CornerRadius::same(12);
-    visuals.menu_corner_radius = egui::CornerRadius::same(10);
-    visuals
-}
-
-fn shell_frame() -> egui::Frame {
-    #[cfg(windows)]
-    let fill = egui::Color32::from_rgba_unmultiplied(16, 12, 18, 150);
-    #[cfg(not(windows))]
-    let fill = egui::Color32::from_rgb(16, 14, 20);
-    egui::Frame::new()
-        .fill(fill)
-        .inner_margin(egui::Margin::same(16))
-}
-
-fn card_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(egui::Color32::from_rgba_unmultiplied(34, 28, 36, 214))
-        .stroke(egui::Stroke::new(
-            1.0_f32,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 32),
-        ))
-        .corner_radius(egui::CornerRadius::same(16))
-        .inner_margin(egui::Margin::same(14))
-        .outer_margin(egui::Margin::symmetric(4, 0))
-        .shadow(egui::Shadow {
-            offset: [0, 8],
-            blur: 18,
-            spread: 0,
-            color: egui::Color32::from_black_alpha(80),
-        })
-}
-
-fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    card_frame().show(ui, |ui| {
-        ui.label(egui::RichText::new(title).strong().size(15.0));
-        ui.add_space(8.0);
-        add(ui);
-    });
-}
-
-fn dim(text: &str) -> egui::RichText {
-    egui::RichText::new(text).color(egui::Color32::from_rgb(186, 180, 186))
-}
-
-/// The main action of a card.
-fn accent_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(
-        egui::RichText::new(text)
-            .strong()
-            .color(egui::Color32::WHITE),
-    )
-    .fill(ACCENT)
-    .corner_radius(egui::CornerRadius::same(10))
-    .min_size(egui::vec2(160.0, 34.0))
-}
-
-fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.22))
-        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.5)))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(8, 3))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).color(color).size(12.0));
-        });
 }
 
 fn apply_window_material() -> bool {
@@ -1181,456 +1181,74 @@ impl App {
             input
                 .viewport()
                 .inner_rect
-                .map(|rect| rect.width() < 900.0)
+                .map(|rect| rect.width() < 1000.0 || rect.height() < 660.0)
                 .unwrap_or(true)
         });
         if narrow {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1000.0, 640.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1200.0, 780.0)));
         }
     }
 
-    fn header(&self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 22.0), egui::Sense::hover());
-            let mark = if self.snapshot.is_some() {
-                ACCENT
-            } else {
-                egui::Color32::from_rgb(120, 116, 124)
-            };
-            ui.painter().circle_filled(rect.center(), 5.0, mark);
-            ui.heading("Pump screen");
-            ui.label(dim("ROG Strix LC IV"));
-            let (text, color) = if self.snapshot.is_some() {
-                ("Connected", egui::Color32::from_rgb(126, 196, 154))
-            } else if self.busy {
-                ("Connecting", egui::Color32::from_rgb(230, 186, 120))
-            } else {
-                ("Offline", egui::Color32::from_rgb(176, 170, 176))
-            };
-            status_pill(ui, text, color);
-            if let Some(shot) = &self.snapshot {
-                ui.label(dim(&format!(
-                    "{}   {}   {} free",
-                    shot.serial, shot.firmware, shot.free_space
-                )));
-            }
-        });
-    }
-
-    fn picture_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        section(ui, "Picture", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for (tab, label) in [
-                    (Source::Picture, "Your photo or video"),
-                    (Source::Dashboard, "Stats dashboard"),
-                    (Source::Animation, "Pump animation"),
-                ] {
-                    let selected = self.picture_tab == tab;
-                    // A dot marks what the pump is showing.
-                    let label = if self.settings.source == tab {
-                        format!("● {label}")
-                    } else {
-                        label.to_string()
-                    };
-                    let mut text = egui::RichText::new(label);
-                    if selected {
-                        text = text.strong().color(egui::Color32::WHITE);
-                    }
-                    let mut button =
-                        egui::Button::new(text).corner_radius(egui::CornerRadius::same(10));
-                    if selected {
-                        button = button.fill(ACCENT);
-                    }
-                    if ui.add(button).clicked() {
-                        self.picture_tab = tab;
-                    }
-                }
-            });
-            ui.add_space(6.0);
-            if self.snapshot.as_ref().is_some_and(|shot| !shot.screen_on) {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 186, 110),
-                        "The screen is switched off, so nothing shows.",
+    fn choose_firmware(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("ASUS firmware package", &["zip"])
+            .pick_file()
+        else {
+            return;
+        };
+        match crate::firmware::read(&path) {
+            Ok(package) => {
+                let installed = self.snapshot.as_ref().map(|shot| shot.firmware.clone());
+                if installed.as_deref().is_some_and(|installed| {
+                    crate::firmware::is_downgrade(&package.version, installed)
+                }) {
+                    self.status = format!(
+                        "{} is older than the pump's {}. The pump does not go back to older firmware.",
+                        package.version,
+                        installed.unwrap_or_default()
                     );
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("Turn on"))
-                        .clicked()
-                    {
-                        self.apply_setting(Setting::ScreenOn(true));
-                    }
-                });
-                ui.add_space(4.0);
+                    return;
+                }
+                self.firmware_offer = Some(package);
             }
-            match self.picture_tab {
-                Source::Picture => self.my_picture(ui, ctx),
-                Source::Dashboard => self.dashboard_tab(ui),
-                Source::Animation => self.animation_tab(ui),
-            }
-        });
-    }
-
-    fn dashboard_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label(dim(
-            "The readings picked under Stats panel, on a dark background. \
-             This app draws it once a second, so it stops updating when the app quits.",
-        ));
-        ui.add_space(6.0);
-        let showing = self.settings.source == Source::Dashboard;
-        let ready = !self.settings.stats_items.is_empty() && !self.busy;
-        if showing {
-            ui.label(egui::RichText::new("On the pump now.").strong());
-        } else if ui
-            .add_enabled(ready, accent_button("Show dashboard on pump"))
-            .clicked()
-        {
-            self.show_dashboard();
-        }
-        if self.settings.stats_items.is_empty() {
-            ui.label(dim("Pick some readings under Stats panel first."));
+            Err(error) => self.status = format!("{error:#}"),
         }
     }
 
-    fn animation_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label(dim(
-            "The animation stored in the pump. Nothing is sent from this computer, \
-             so it keeps playing after this app quits.",
-        ));
-        ui.add_space(6.0);
-        if self.settings.source == Source::Animation {
-            ui.label(egui::RichText::new("On the pump now.").strong());
-        } else if ui
-            .add_enabled(!self.busy, accent_button("Show pump animation"))
-            .clicked()
-        {
-            self.show_animation();
-        }
-    }
-
-    fn my_picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            if ui.button("Choose file…").clicked() && !self.busy {
-                self.choose_file(ctx);
-            }
-            if let Some(path) = &self.chosen {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("chosen file");
-                ui.label(egui::RichText::new(name).strong())
-                    .on_hover_text(path.display().to_string());
-            }
-        });
-        if let Some(preview) = &self.preview {
-            ui.label(dim("Drag the square to crop."));
-            let crop_settled = crop_view(
-                ui,
-                preview,
-                self.source_width,
-                self.source_height,
-                &mut self.zoom,
-                &mut self.pan_x,
-                &mut self.pan_y,
-            );
-            if crop_settled {
-                self.persist();
-            }
-        }
-        ui.horizontal(|ui| {
-            let zoom_slider = ui.add(egui::Slider::new(&mut self.zoom, 1.0..=4.0).text("Zoom"));
-            if zoom_slider.drag_stopped() {
-                self.persist();
-            }
-            if ui.button("Reset").clicked() {
-                self.zoom = 1.0;
-                self.pan_x = 0.0;
-                self.pan_y = 0.0;
-                self.persist();
-            }
-        });
-        ui.horizontal(|ui| {
-            let speed_slider = ui.add(
-                egui::Slider::new(&mut self.speed, 0.25..=2.0)
-                    .fixed_decimals(2)
-                    .text("Speed")
-                    .suffix("×"),
-            );
-            if speed_slider.drag_stopped() {
-                self.worker.set_speed(self.speed);
-                self.persist();
-            } else if speed_slider.changed() {
-                self.worker.set_speed(self.speed);
-            }
-        });
-        ui.label(dim(
-            "1× matches the video. Crop applies the next time you press Show.",
-        ));
-        ui.horizontal(|ui| {
-            let can_send = self.chosen.is_some() && !self.busy;
-            if ui
-                .add_enabled(can_send, accent_button("Show on pump"))
-                .clicked()
-            {
-                self.send_chosen();
-            }
-            if ui.button("Stop video").clicked() {
-                self.worker.stop_playback();
-                self.status = "Stopped. The last frame stays until you quit.".into();
-            }
-        });
-    }
-
-    fn controls_card(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Screen", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(dim("Brightness"));
-                let screen_on = self.snapshot.as_ref().is_none_or(|shot| shot.screen_on);
-                let slider = ui.add_enabled(
-                    screen_on,
-                    egui::Slider::new(&mut self.brightness, 0..=100).suffix("%"),
-                );
-                if slider.drag_stopped() && !self.busy {
-                    self.apply_brightness();
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label(dim("Rotation"));
-                let current = self.snapshot.as_ref().map(|shot| shot.rotation);
-                for degrees in [0u16, 90, 180, 270] {
-                    let selected = current == Some(degrees);
-                    let mut button = egui::Button::new(format!("{degrees}°"));
-                    if selected {
-                        button = button.fill(ACCENT);
-                    }
-                    if ui.add_enabled(!self.busy, button).clicked() {
-                        self.apply_rotation(degrees);
-                    }
-                }
-                if ui.button("Wake").clicked() && !self.busy {
-                    self.apply_power("resume");
-                }
-                if ui.button("Sleep").clicked() && !self.busy {
-                    self.apply_power("suspend");
-                }
-                if ui.button("Refresh").clicked() && !self.busy {
-                    self.busy = true;
-                    self.status = "Reading the pump…".into();
-                    self.pending = Some(spawn_snapshot(&self.worker));
-                }
-            });
-            if let Some(shot) = self.snapshot.clone() {
-                let mut screen_on = shot.screen_on;
-                let toggle = ui
-                    .add_enabled(!self.busy, egui::Checkbox::new(&mut screen_on, "Screen on"))
-                    .on_hover_text("Off keeps the panel dark until you turn it back on.");
-                if toggle.changed() {
-                    self.apply_setting(Setting::ScreenOn(screen_on));
-                }
-                let mut standby = shot.display_in_sleep;
-                let toggle = ui
-                    .add_enabled(
-                        !self.busy,
-                        egui::Checkbox::new(
-                            &mut standby,
-                            "Play the standby clip while the computer sleeps",
-                        ),
-                    )
-                    .on_hover_text("Off turns the panel off while the computer sleeps.");
-                if toggle.changed() {
-                    self.apply_setting(Setting::DisplayInSleep(standby));
-                }
-            }
-        });
-        ui.add_space(8.0);
-        section(ui, "Startup and tray", |ui| {
-            if ui
-                .checkbox(
-                    &mut self.settings.close_to_tray,
-                    "Keep running in the tray when the window closes",
-                )
-                .changed()
-            {
-                self.persist();
-            }
-            if ui
-                .checkbox(
-                    &mut self.settings.start_with_windows,
-                    sign_in_startup_label(),
-                )
-                .changed()
-            {
-                if let Err(error) = settings::set_run_at_logon(
-                    self.settings.start_with_windows,
-                    self.settings.start_in_tray,
-                ) {
-                    self.settings.start_with_windows = !self.settings.start_with_windows;
-                    self.status = format!("{error:#}");
-                } else {
-                    self.persist();
-                }
-            }
-            if ui
-                .checkbox(
-                    &mut self.settings.start_in_tray,
-                    "At sign-in, stay in the tray instead of opening this window",
-                )
-                .changed()
-            {
-                if self.settings.start_with_windows {
-                    if let Err(error) =
-                        settings::set_run_at_logon(true, self.settings.start_in_tray)
-                    {
-                        self.status = format!("{error:#}");
-                    }
-                }
-                self.persist();
-            }
-            if ui
-                .checkbox(
-                    &mut self.settings.resume_last,
-                    "Play the last photo or video when the app opens",
-                )
-                .changed()
-            {
-                self.persist();
-            }
-            if ui
-                .checkbox(
-                    &mut self.settings.sleep_when_locked,
-                    "Sleep the pump screen while this computer is locked",
-                )
-                .changed()
-            {
-                self.follow_lock
-                    .store(self.settings.sleep_when_locked, Ordering::Relaxed);
-                self.persist();
-            }
-            ui.label(dim(
-                "Click the tray icon to show this window. Right-click it to stop or quit.",
-            ));
-        });
-        ui.add_space(8.0);
-        self.stats_card(ui);
-    }
-
-    fn stats_card(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Stats panel", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .checkbox(
-                        &mut self.settings.stats_on_picture,
-                        "Show on your photo or video",
-                    )
-                    .changed()
-                {
-                    self.persist();
-                }
-                if self.settings.stats_on_picture {
-                    for (position, label) in [(Position::Top, "Top"), (Position::Bottom, "Bottom")]
-                    {
-                        let mut button = egui::Button::new(label);
-                        if self.settings.stats_position == position {
-                            button = button.fill(ACCENT);
-                        }
-                        if ui.add(button).clicked() {
-                            self.settings.stats_position = position;
-                            self.persist();
-                        }
-                    }
-                }
-            });
-            ui.label(dim(&format!(
-                "Up to {} readings, plus the time and date on a line of their own.",
-                stats_panel::MAX_TILES.min(stats_panel::MAX_ON_PICTURE)
-            )));
-            ui.add_space(4.0);
-            let readings = self.stats.readings();
-            let mut changed = false;
-            for group in [
-                "CPU", "GPU", "Memory", "Disk", "Network", "Cooling", "Clock",
-            ] {
-                ui.horizontal_wrapped(|ui| {
-                    ui.add_sized([62.0, 20.0], egui::Label::new(dim(group)));
-                    for metric in stats::ALL
-                        .into_iter()
-                        .filter(|metric| metric.group() == group)
-                    {
-                        changed |= self.metric_checkbox(ui, metric, readings.as_ref());
-                    }
-                });
-            }
-            if changed {
-                self.persist();
-            }
-            if let Some(readings) = &readings {
-                let missing = |source| {
-                    stats::ALL
-                        .iter()
-                        .any(|metric| metric.source() == source && !readings.has(*metric))
-                };
-                if cfg!(windows) && missing(stats::Source::HwInfo) {
-                    ui.label(dim(
-                        "CPU temperature and power, pump, coolant, and fan speeds come from \
-                         HWiNFO. Run it with Shared Memory Support turned on in its settings.",
-                    ));
-                }
-                if missing(stats::Source::Nvidia) {
-                    ui.label(dim("GPU readings need an NVIDIA card."));
-                }
-            }
-        });
-    }
-
-    /// One reading's checkbox, with its live value. Returns true if it changed.
-    fn metric_checkbox(
-        &mut self,
-        ui: &mut egui::Ui,
-        metric: Metric,
-        readings: Option<&stats::Readings>,
-    ) -> bool {
-        let chosen = self.settings.stats_items.contains(&metric);
-        let clock = matches!(metric, Metric::Time | Metric::Date);
-        let available = clock || readings.is_none_or(|readings| readings.has(metric));
-        let readings_chosen = self
-            .settings
-            .stats_items
-            .iter()
-            .filter(|metric| !matches!(metric, Metric::Time | Metric::Date))
-            .count();
-        let full = !clock && readings_chosen >= stats_panel::MAX_TILES;
-        let label = match readings.filter(|_| available && !clock) {
-            Some(readings) => format!("{} {}", metric.name(), readings.text(metric)),
-            None => metric.name().to_string(),
+    fn install_firmware(&mut self) {
+        let Some(package) = self.firmware_offer.take() else {
+            return;
         };
-        let mut on = chosen;
-        let response = ui.add_enabled(
-            available && (chosen || !full),
-            egui::Checkbox::new(&mut on, label),
+        if self.asus_running {
+            self.status = "Quit the ROG STRIX LC app first.".into();
+            return;
+        }
+        self.busy = true;
+        self.status = format!(
+            "Sending firmware {}. Keep the computer awake…",
+            package.version
         );
-        let response = if !available {
-            response.on_disabled_hover_text(match metric.source() {
-                stats::Source::Nvidia => "Needs an NVIDIA card.",
-                _ if cfg!(windows) => "Needs HWiNFO running with Shared Memory Support on.",
-                _ => "This computer does not report it.",
-            })
-        } else if full && !chosen {
-            response.on_disabled_hover_text("Take another reading off first.")
-        } else {
-            response
-        };
-        if !response.changed() {
-            return false;
-        }
-        if on {
-            self.settings.stats_items.push(metric);
-            // Keep the window's order, so the panel matches the list.
-            self.settings
-                .stats_items
-                .sort_by_key(|item| stats::ALL.iter().position(|metric| metric == item));
-        } else {
-            self.settings.stats_items.retain(|item| *item != metric);
-        }
-        true
+        let (tx, rx) = mpsc::channel();
+        let worker_tx = self.worker.tx.clone();
+        thread::spawn(move || {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            let result = if worker_tx
+                .send(Request::Firmware(package.bytes, reply_tx))
+                .is_err()
+            {
+                Err(anyhow_worker())
+            } else {
+                reply_rx.recv().unwrap_or_else(|_| Err(anyhow_worker()))
+            };
+            let _ = tx.send(JobResult::Firmware(result));
+        });
+        self.pending = Some(rx);
+    }
+
+    fn refresh(&mut self) {
+        self.busy = true;
+        self.status = "Reading the pump…".into();
+        self.pending = Some(spawn_snapshot(&self.worker));
     }
 
     /// Hand one request to the screen worker. The reply refreshes the controls.
@@ -1833,6 +1451,30 @@ impl App {
     }
 }
 
+/// Wait for the pump to restart, then read it. It is gone for about ten
+/// seconds and takes a while longer to finish booting.
+fn spawn_snapshot_after_restart(worker: &Worker) -> Receiver<JobResult> {
+    let (tx, rx) = mpsc::channel();
+    let worker_tx = worker.tx.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(15));
+        let mut last = Err(anyhow_worker());
+        for _ in 0..20 {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if worker_tx.send(Request::Refresh(reply_tx)).is_err() {
+                break;
+            }
+            last = reply_rx.recv().unwrap_or_else(|_| Err(anyhow_worker()));
+            if last.is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(3));
+        }
+        let _ = tx.send(JobResult::Snapshot(last));
+    });
+    rx
+}
+
 fn spawn_snapshot(worker: &Worker) -> Receiver<JobResult> {
     let (tx, rx) = mpsc::channel();
     let worker_tx = worker.tx.clone();
@@ -1856,12 +1498,20 @@ fn spawn_snapshot(worker: &Worker) -> Receiver<JobResult> {
 
 /// What the stats panel thread should draw for these settings.
 fn panel_config(settings: &Settings, window_open: bool) -> stats_panel::Config {
+    let picture = (settings.stats_on_picture && settings.source == Source::Picture).then(|| {
+        settings
+            .picture_layout
+            .as_ref()
+            .map(|layout| layout.widgets.clone())
+            .unwrap_or_default()
+    });
+    let dashboard = (settings.source == Source::Dashboard)
+        .then(|| settings.dashboard_layout.clone().unwrap_or_default());
     stats_panel::Config {
-        items: settings.stats_items.clone(),
-        on_picture: settings.stats_on_picture && settings.source == Source::Picture,
-        position: settings.stats_position,
-        dashboard: settings.source == Source::Dashboard,
+        picture,
+        dashboard,
         window_open,
+        fahrenheit: settings.fahrenheit,
     }
 }
 
@@ -2261,7 +1911,7 @@ fn pump_window_is_on_screen() -> bool {
 
 #[cfg(windows)]
 fn pump_hwnd() -> Option<*mut std::ffi::c_void> {
-    let title: Vec<u16> = "Pump screen"
+    let title: Vec<u16> = window_title()
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -2366,8 +2016,9 @@ fn apply_windows_material() -> bool {
         // DWMWA_USE_IMMERSIVE_DARK_MODE
         let _ = DwmSetWindowAttribute(hwnd, 20, &dark as *const u32 as _, 4);
         if is_windows_11() {
-            // DWMSBT_TRANSIENTWINDOW is the acrylic blur. Mica is 2, mica alt is 4.
-            let backdrop: i32 = 3;
+            // No system backdrop: Windows turns those solid while the window is
+            // inactive. The acrylic accent below keeps blurring when unfocused.
+            let backdrop: i32 = 1;
             let _ = DwmSetWindowAttribute(hwnd, 38, &backdrop as *const i32 as _, 4);
             // DWMWCP_ROUND
             let corners: i32 = 2;
@@ -2379,16 +2030,16 @@ fn apply_windows_material() -> bool {
             let _ = DwmSetWindowAttribute(hwnd, 34, &border as *const u32 as _, 4);
             let _ = DwmSetWindowAttribute(hwnd, 35, &caption as *const u32 as _, 4);
             let _ = DwmSetWindowAttribute(hwnd, 36, &text as *const u32 as _, 4);
-            let margins = DwmMargins {
-                cx_left_width: -1,
-                cx_right_width: -1,
-                cy_top_height: -1,
-                cy_bottom_height: -1,
-            };
-            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-        } else {
-            enable_acrylic(hwnd);
         }
+        // The whole client area is glass, so egui's transparent pixels show the blur.
+        let margins = DwmMargins {
+            cx_left_width: -1,
+            cx_right_width: -1,
+            cy_top_height: -1,
+            cy_bottom_height: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        enable_acrylic(hwnd);
     }
     true
 }
@@ -2456,7 +2107,7 @@ fn enable_acrylic(hwnd: *mut std::ffi::c_void) {
         let mut policy = AccentPolicy {
             state: 4,
             flags: 2,
-            color: 0xCC1A1218,
+            color: 0x401A1218,
             animation: 0,
         };
         let mut data = CompositionAttribute {

@@ -155,12 +155,20 @@ pub fn preview_jpeg(path: &Path) -> Result<Preview> {
     })
 }
 
+/// Clips are decoded into memory up front, so length and rate are capped. A
+/// 60 KB frame takes about 15 ms to send, so 24 frames a second leaves room
+/// for drawing widgets on each one.
+const MAX_FPS: f32 = 24.0;
+const MAX_SECONDS: u32 = 60;
+const MAX_FRAMES: usize = MAX_FPS as usize * MAX_SECONDS as usize;
+
 pub fn video_jpegs(path: &Path, crop: &Crop) -> Result<Clip> {
     let ffmpeg = require_ffmpeg()?;
     let probe = probe_media(&ffmpeg, path)?;
-    let capture_fps = probe.fps.clamp(4.0, 8.0);
+    let capture_fps = probe.fps.clamp(4.0, MAX_FPS);
     let frame_ms = (1000.0 / capture_fps).round().max(1.0) as u64;
-    let dir = std::env::temp_dir().join("strix-lc-screen-frames");
+    // One folder per process, so a second copy cannot delete frames this one is reading.
+    let dir = std::env::temp_dir().join(format!("strix-lc-screen-frames-{}", std::process::id()));
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -177,7 +185,7 @@ pub fn video_jpegs(path: &Path, crop: &Crop) -> Result<Clip> {
                 &path.to_string_lossy(),
                 "-an",
                 "-t",
-                "20",
+                &MAX_SECONDS.to_string(),
                 "-vf",
                 &filter,
                 "-r",
@@ -201,7 +209,7 @@ pub fn video_jpegs(path: &Path, crop: &Crop) -> Result<Clip> {
                     .with_context(|| format!("could not read {}", file.display()))?,
             );
             index += 1;
-            if frames.len() >= 160 {
+            if frames.len() >= MAX_FRAMES {
                 break;
             }
         }

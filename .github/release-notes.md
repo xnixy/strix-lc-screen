@@ -8,6 +8,18 @@ A small app for the ROG Strix LC IV / SLC IV pump screen (USB 0B05:1DE7). It tal
 
 The package installs the program and the USB permission. After it is installed, unplug the cooler and plug it back in, then run strix-lc-screen. The tarball has the same program, plus ffmpeg and the udev rule, if you would rather not use the package. Copy that rule, reload udev, and unplug the cooler once.
 
+New in 0.3.0:
+
+- A new window, in the same style as Blurman: a sidebar with the pump's status and four pages, Show, Widgets, Screen, and Settings.
+- Put readings anywhere. The Widgets page has a live preview of the pump screen. Drag a reading to move it, drag its corner to resize it, and choose text, tile, gauge, or bar, and a color. It snaps to the middle, the edges, and other readings, and Ctrl+Z undoes. Your 0.2 stats band and dashboard carry over where they were.
+- Up to 24 readings on the screen, instead of 6.
+- Dashboard backgrounds: corner glow, spotlight, or plain, in any of the colors.
+- Temperatures in °C or °F.
+- Update the pump's firmware from the Screen page with a package from ASUS. The package is checked first: it has to be for this model, not damaged, and not older than what the pump has. It is then sent exactly the way the ASUS app sends it.
+- The window keeps its frosted glass when another window has focus.
+- Videos up to 60 seconds at up to 24 frames per second, up from 20 seconds at 8.
+- The picture comes back after the computer wakes from sleep. Before, the app could give up after a few failed frames, and with "Sleep the screen while locked" on, unlocking after sleep could leave it paused.
+
 New in 0.2.1:
 
 - The time and date show on the stats band over a photo or video. They get their own line, so all 6 readings still fit.
@@ -31,7 +43,7 @@ What you can do:
 
 Click the tray icon to open the window. Right-click it to stop the video or quit. Stop video leaves the last frame on the pump. Quit exits the program.
 
-The cooler does not store your clip or the stats panel. Pictures are sent as JPEG frames from this computer, and playback continues while this program is running, including from the tray. After you quit, the pump goes back to its built-in animation. Video is limited to about 20 seconds, sampled at up to 8 frames per second.
+The cooler does not store your clip or the stats panel. Pictures are sent as JPEG frames from this computer, and playback continues while this program is running, including from the tray. After you quit, the pump goes back to its built-in animation. Video is limited to 60 seconds, sampled at up to 24 frames per second.
 
 The pump and fans are not controlled over this USB connection. They run from the motherboard headers.
 

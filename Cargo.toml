@@ -1,6 +1,6 @@
 [package]
 name = "strix-lc-screen"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Controller for the ROG Strix LC IV pump screen"
 license = "MIT"
