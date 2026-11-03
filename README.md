@@ -41,8 +41,9 @@ Builds are on the [releases page](https://github.com/xnixy/strix-lc-screen/relea
 - `strix-lc-screen-windows-x86_64.zip`. Unzip it and run `strix-lc-screen.exe`. Keep `ffmpeg.exe` in that folder.
 - `strix-lc-screen-linux-x86_64.tar.gz`. The program, ffmpeg, and a udev rule.
 - `strix-lc-screen_<version>_amd64.deb` for Debian and Ubuntu.
+- `strix-lc-screen-<version>-1.x86_64.rpm` for Fedora. Install it with `sudo dnf install ./strix-lc-screen-<version>-1.x86_64.rpm`.
 
-The package installs the program and the USB permission. After it is installed, unplug the cooler and plug it back in, then run `strix-lc-screen`.
+Either package installs the program and the USB permission. After it is installed, unplug the cooler and plug it back in, then run `strix-lc-screen`.
 
 If you use the tarball, copy the rule yourself:
 
@@ -74,7 +75,16 @@ cargo build --release
 ./target/release/strix-lc-screen
 ```
 
-A source build does not include ffmpeg. Install it, or put the `ffmpeg` binary in the same folder as the program. To put ffmpeg inside the `.deb`, run `./packaging/fetch-ffmpeg.sh`, then `cargo install cargo-deb` and `cargo deb`. The package is in `target/debian/`.
+On Fedora:
+
+```bash
+sudo dnf install gcc pkgconf-pkg-config systemd-devel libxkbcommon-devel \
+  wayland-devel libX11-devel libxcb-devel libXcursor-devel libXi-devel \
+  libXrandr-devel mesa-libGL-devel
+cargo build --release
+```
+
+A source build does not include ffmpeg. Install it, or put the `ffmpeg` binary in the same folder as the program. To put ffmpeg inside the `.deb`, run `./packaging/fetch-ffmpeg.sh`, then `cargo install cargo-deb` and `cargo deb`. The package is in `target/debian/`. For an `.rpm`, run `cargo install cargo-generate-rpm`, then `cargo generate-rpm`. It is in `target/generate-rpm/`.
 
 With no arguments, the program opens the window. Sign-in startup uses `--tray`, which opens straight into the tray.
 

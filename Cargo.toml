@@ -54,3 +54,31 @@ assets = [
     ["packaging/FFMPEG.txt", "usr/share/doc/strix-lc-screen/ffmpeg.txt", "644"],
     ["assets/fonts/OFL.txt", "usr/share/doc/strix-lc-screen/font-license.txt", "644"],
 ]
+
+# Fedora and other RPM distributions. Built with cargo-generate-rpm.
+[package.metadata.generate-rpm]
+release = "1"
+assets = [
+    { source = "target/release/strix-lc-screen", dest = "/usr/bin/strix-lc-screen", mode = "755" },
+    { source = "linux/60-strix-lc-screen.rules", dest = "/usr/lib/udev/rules.d/60-strix-lc-screen.rules", mode = "644" },
+    { source = "linux/strix-lc-screen.desktop", dest = "/usr/share/applications/strix-lc-screen.desktop", mode = "644" },
+    { source = "packaging/ffmpeg", dest = "/usr/lib/strix-lc-screen/ffmpeg", mode = "755" },
+    { source = "LICENSE", dest = "/usr/share/licenses/strix-lc-screen/LICENSE", mode = "644" },
+    { source = "packaging/FFMPEG.txt", dest = "/usr/share/doc/strix-lc-screen/ffmpeg.txt", mode = "644", doc = true },
+    { source = "assets/fonts/OFL.txt", dest = "/usr/share/doc/strix-lc-screen/font-license.txt", mode = "644", doc = true },
+]
+# $1 is 0 only when the package is removed, not when it is upgraded.
+post_install_script = """
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || true
+    udevadm trigger --subsystem-match=hidraw || true
+fi
+"""
+post_uninstall_script = """
+if [ "$1" -eq 0 ] && command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || true
+fi
+"""
+
+[package.metadata.generate-rpm.recommends]
+xdg-desktop-portal = "*"

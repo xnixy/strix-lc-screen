@@ -105,12 +105,18 @@ jobs:
           cargo deb --no-build
           mkdir -p dist
           cp target/debian/strix-lc-screen_*.deb dist/
+      - name: RPM package
+        run: |
+          cargo install cargo-generate-rpm --version 0.21.1 --locked
+          cargo generate-rpm
+          cp target/generate-rpm/strix-lc-screen-*.rpm dist/
       - uses: actions/upload-artifact@v4
         with:
           name: linux
           path: |
             dist/strix-lc-screen-linux-x86_64.tar.gz
             dist/strix-lc-screen_*.deb
+            dist/strix-lc-screen-*.rpm
 
   publish:
     needs: [version, windows, linux]
@@ -137,3 +143,4 @@ jobs:
             dist/strix-lc-screen-windows-x86_64.zip
             dist/strix-lc-screen-linux-x86_64.tar.gz
             dist/strix-lc-screen_*.deb
+            dist/strix-lc-screen-*.rpm

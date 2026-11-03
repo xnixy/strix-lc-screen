@@ -1,0 +1,9 @@
+# Keep LF everywhere. The Debian scripts, udev rule and desktop file break
+# with CRLF, and the release builds package them as they are checked out.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
+*.ttf binary
+*.otf binary
+*.ico binary
