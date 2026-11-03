@@ -2,14 +2,14 @@
 //! style as Blurman.
 
 use super::editor::{Canvas, Edit};
-use super::{crop_view, App, Page, Setting, Source};
+use super::{crop_view, App, Page, Source};
 use crate::layout::{self, Layout, Widget};
 use crate::media::{self, Crop};
+use crate::session::Setting;
 use crate::settings;
 use crate::theme::{self, ACCENT, MUTED, OK, TEXT, WARN};
 use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Layout as Flow, Rect, RichText, Sense, Stroke, Ui};
-use std::sync::atomic::Ordering;
 
 const SIDEBAR_WIDTH: f32 = 236.0;
 /// The column beside the widget editor's screen.
@@ -149,8 +149,7 @@ impl App {
         if install {
             self.install_firmware();
         } else if cancel || modal.should_close() {
-            self.firmware_offer = None;
-            self.status = "Firmware update cancelled.".into();
+            self.cancel_firmware();
         }
     }
 
@@ -361,11 +360,11 @@ impl App {
                             let settled = crop_view(
                                 ui,
                                 preview,
-                                self.source_width,
-                                self.source_height,
-                                &mut self.zoom,
-                                &mut self.pan_x,
-                                &mut self.pan_y,
+                                self.core.source_width,
+                                self.core.source_height,
+                                &mut self.core.zoom,
+                                &mut self.core.pan_x,
+                                &mut self.core.pan_y,
                             );
                             if settled {
                                 self.persist();
@@ -382,7 +381,7 @@ impl App {
                                 Stroke::new(1.0_f32, Color32::from_white_alpha(40)),
                                 egui::StrokeKind::Inside,
                             );
-                            let message = if self.preview_rx.is_some() {
+                            let message = if self.loading_preview() {
                                 "Loading…"
                             } else {
                                 "Choose a photo or video"
@@ -453,7 +452,8 @@ impl App {
                             )
                         });
                         if speed.changed() {
-                            self.worker.set_speed(self.speed);
+                            let speed = self.speed;
+                            self.set_speed(speed);
                         }
                         if speed.drag_stopped() || speed.lost_focus() {
                             self.persist();
@@ -498,8 +498,7 @@ impl App {
                 if self.chosen.as_deref().is_some_and(media::is_video)
                     && ui.button("Stop video").clicked()
                 {
-                    self.worker.stop_playback();
-                    self.status = "Stopped. The last frame stays until you quit.".into();
+                    self.stop_video();
                 }
                 ui.label(theme::muted("Crop and zoom apply the next time you press Show.").small());
             });
@@ -637,16 +636,18 @@ impl App {
         };
         let picture = cropped(
             self.preview.as_ref(),
-            self.source_width,
-            self.source_height,
+            self.core.source_width,
+            self.core.source_height,
             &crop,
         );
         let layout = match canvas {
             Canvas::Dashboard => self
+                .core
                 .settings
                 .dashboard_layout
                 .get_or_insert_with(Layout::default),
             Canvas::Picture => self
+                .core
                 .settings
                 .picture_layout
                 .get_or_insert_with(Layout::default),
@@ -917,14 +918,8 @@ impl App {
                     self.persist();
                 }
                 let mut start = self.settings.start_with_windows;
-                if theme::switch_row(ui, &mut start, super::sign_in_startup_label(), "") {
-                    match settings::set_run_at_logon(start, self.settings.start_in_tray) {
-                        Ok(()) => {
-                            self.settings.start_with_windows = start;
-                            self.persist();
-                        }
-                        Err(error) => self.status = format!("{error:#}"),
-                    }
+                if theme::switch_row(ui, &mut start, crate::engine::sign_in_startup_label(), "") {
+                    self.set_start_at_sign_in(start);
                 }
                 let mut in_tray = self.settings.start_in_tray;
                 if theme::switch_row(
@@ -933,13 +928,7 @@ impl App {
                     "Start in the tray",
                     "At sign-in, stay in the tray instead of opening this window.",
                 ) {
-                    self.settings.start_in_tray = in_tray;
-                    if self.settings.start_with_windows {
-                        if let Err(error) = settings::set_run_at_logon(true, in_tray) {
-                            self.status = format!("{error:#}");
-                        }
-                    }
-                    self.persist();
+                    self.set_start_in_tray(in_tray);
                 }
                 let mut resume = self.settings.resume_last;
                 if theme::switch_row(
@@ -972,9 +961,7 @@ impl App {
                     "Sleep the screen while locked",
                     "Wakes it again when you unlock.",
                 ) {
-                    self.settings.sleep_when_locked = follow;
-                    self.follow_lock.store(follow, Ordering::Relaxed);
-                    self.persist();
+                    self.set_sleep_when_locked(follow);
                 }
             });
             right.add_space(10.0);

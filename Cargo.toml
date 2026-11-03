@@ -1,6 +1,6 @@
 [package]
 name = "strix-lc-screen"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 description = "Controller for the ROG Strix LC IV pump screen"
 license = "MIT"
@@ -12,24 +12,29 @@ name = "strix-lc-screen"
 path = "src/main.rs"
 
 [dependencies]
-# Draws the stats panel text. egui already depends on it.
+# Draws the stats panel text.
 ab_glyph = "0.2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-eframe = "0.31"
 # Linux must use hidraw. The libusb backend does not report usage page, so the
 # pump's vendor interface (0xFF00 / 0x0001) would be invisible.
 hidapi = { version = "2", default-features = false, features = ["linux-static-hidraw"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp"] }
-rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The egui window. Linux uses GTK instead.
 [target.'cfg(windows)'.dependencies]
+eframe = "0.31"
+rfd = "0.15"
 tray-icon = "0.20"
 winreg = "0.55"
 
+# GTK 4.14 and libadwaita 1.5 are what Ubuntu 24.04 ships, the oldest system
+# the release build supports. Newer API stays behind these feature flags.
 [target.'cfg(target_os = "linux")'.dependencies]
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 ksni = { version = "0.3", features = ["blocking"] }
 
 [package.metadata.deb]
@@ -40,7 +45,7 @@ extended-description = """\
 Drives the pump screen on a ROG Strix LC IV cooler.
 Photos and short videos are sent as JPEG frames while this program is running.
 ffmpeg is included."""
-depends = "libc6 (>= 2.39), libudev1 (>= 183)"
+depends = "libc6 (>= 2.39), libudev1 (>= 183), libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5)"
 recommends = "xdg-desktop-portal"
 section = "utils"
 priority = "optional"

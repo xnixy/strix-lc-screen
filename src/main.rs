@@ -1,11 +1,15 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod engine;
 mod firmware;
 mod frame;
 mod gpu;
+#[cfg(windows)]
 mod gui;
 mod hwinfo;
 mod layout;
+#[cfg(target_os = "linux")]
+mod linux;
 mod lock;
 mod media;
 mod msg;
@@ -14,7 +18,9 @@ mod sensors;
 mod session;
 mod settings;
 mod stats;
+#[cfg(windows)]
 mod theme;
+mod tray;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -70,10 +76,13 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let tray_only = args.len() == 1 && args[0] == "--tray";
     if args.is_empty() || tray_only {
+        #[cfg(windows)]
         if let Err(error) = gui::run(tray_only) {
             eprintln!("{error}");
             std::process::exit(1);
         }
+        #[cfg(target_os = "linux")]
+        linux::run(tray_only);
         return Ok(());
     }
     attach_console();

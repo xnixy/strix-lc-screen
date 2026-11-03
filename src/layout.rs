@@ -337,6 +337,42 @@ pub fn arrange_band(items: &[Metric], at_top: bool) -> Layout {
     }
 }
 
+/// Snap distance, in screen pixels.
+const SNAP: f32 = 9.0;
+/// Lines worth lining up with: the edges, a margin inside them, and the middle.
+const STOPS: [f32; 5] = [0.0, 24.0, SCREEN / 2.0, SCREEN - 24.0, SCREEN];
+
+/// Lines other widgets offer to line up with, on one axis.
+pub fn stops(others: &[Widget], vertical: bool) -> Vec<f32> {
+    let mut lines = STOPS.to_vec();
+    for widget in others {
+        let (start, length) = if vertical {
+            (widget.x, widget.w)
+        } else {
+            (widget.y, widget.h)
+        };
+        lines.extend([start, start + length / 2.0, start + length]);
+    }
+    lines
+}
+
+/// The shift that lines one of `edges` up with the nearest stop, and that stop.
+pub fn snap_axis<const N: usize>(edges: [f32; N], stops: &[f32]) -> (f32, Option<f32>) {
+    let mut best: Option<(f32, f32)> = None;
+    for edge in edges {
+        for stop in stops {
+            let shift = stop - edge;
+            if shift.abs() <= SNAP && best.is_none_or(|(current, _)| shift.abs() < current.abs()) {
+                best = Some((shift, *stop));
+            }
+        }
+    }
+    match best {
+        Some((shift, stop)) => (shift, Some(stop)),
+        None => (0.0, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +429,22 @@ mod tests {
         assert_eq!(widget.style, Style::Text);
         assert!(widget.caption);
         assert_eq!(widget.color, PALETTE[0]);
+    }
+
+    #[test]
+    fn snapping_picks_the_closest_line() {
+        let (shift, line) = snap_axis([352.0, 400.0], &[0.0, 360.0, 404.0]);
+        assert_eq!((shift, line), (4.0, Some(404.0)));
+        let (shift, line) = snap_axis([100.0], &[0.0, 360.0]);
+        assert_eq!((shift, line), (0.0, None));
+    }
+
+    #[test]
+    fn other_widgets_offer_their_edges_and_middle() {
+        let widget = Widget::new(Metric::CpuUsage, Style::Text, 360.0, 360.0);
+        let lines = stops(std::slice::from_ref(&widget), true);
+        assert!(lines.contains(&widget.x));
+        assert!(lines.contains(&(widget.x + widget.w / 2.0)));
+        assert!(lines.contains(&(widget.x + widget.w)));
     }
 }

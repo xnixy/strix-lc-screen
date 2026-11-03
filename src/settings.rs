@@ -239,6 +239,7 @@ static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SHOW_HOOK: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 
 /// Wakes the window after a second launch asks the running copy to show itself.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn on_show_request(hook: impl Fn() + Send + Sync + 'static) {
     let _ = SHOW_HOOK.set(Box::new(hook));
 }

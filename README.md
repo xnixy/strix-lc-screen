@@ -6,6 +6,10 @@ The panel is a 720×720 screen on USB device `0B05:1DE7`. This app talks to that
 
 ![The Widgets page. A preview of the pump screen shows the stats dashboard, with tips and a list of readings to add on the right.](docs/pump-screen.png)
 
+On Linux the window is a GTK 4 app with libadwaita, so it looks like the rest of GNOME and follows your theme and dark mode. It needs GTK 4.14 and libadwaita 1.5 or newer: Ubuntu 24.04, Debian 13, Fedora 40, or later.
+
+![The same Widgets page on Linux, in the GNOME style: a sidebar with the pump's status and pages, the screen preview, and grouped lists of settings and readings.](docs/linux-window.png)
+
 ## What you can do
 
 - Set brightness, rotation (0°, 90°, 180°, 270°), and wake or sleep the screen.
@@ -68,9 +72,8 @@ cargo build --release
 On Debian or Ubuntu:
 
 ```bash
-sudo apt install build-essential pkg-config libudev-dev libxkbcommon-dev \
-  libwayland-dev libx11-dev libxcb1-dev libxcursor-dev libxi-dev libxrandr-dev \
-  libgl1-mesa-dev
+sudo apt install build-essential pkg-config libudev-dev libgtk-4-dev \
+  libadwaita-1-dev
 cargo build --release
 ./target/release/strix-lc-screen
 ```
@@ -78,9 +81,8 @@ cargo build --release
 On Fedora:
 
 ```bash
-sudo dnf install gcc pkgconf-pkg-config systemd-devel libxkbcommon-devel \
-  wayland-devel libX11-devel libxcb-devel libXcursor-devel libXi-devel \
-  libXrandr-devel mesa-libGL-devel
+sudo dnf install gcc pkgconf-pkg-config systemd-devel gtk4-devel \
+  libadwaita-devel
 cargo build --release
 ```
 

@@ -85,9 +85,8 @@ jobs:
       - name: Build libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libudev-dev libxkbcommon-dev \
-            libwayland-dev libx11-dev libxcb1-dev libxcursor-dev libxi-dev \
-            libxrandr-dev libgl1-mesa-dev dpkg-dev
+          sudo apt-get install -y pkg-config libudev-dev libgtk-4-dev \
+            libadwaita-1-dev dpkg-dev
       - name: Build
         run: cargo build --release --locked
       - name: Bundle ffmpeg

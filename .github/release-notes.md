@@ -9,6 +9,13 @@ A small app for the ROG Strix LC IV / SLC IV pump screen (USB 0B05:1DE7). It tal
 
 Either package installs the program and the USB permission. After it is installed, unplug the cooler and plug it back in, then run strix-lc-screen. The tarball has the same program, plus ffmpeg and the udev rule, if you would rather not use the package. Copy that rule, reload udev, and unplug the cooler once.
 
+New in 0.4.0:
+
+- A new window on Linux, built with GTK 4 and libadwaita. It looks like a GNOME app and follows your theme, dark mode, and accent color. Every page is still there: Show, Widgets with the drag-and-drop editor, Screen, and Settings.
+- Closing the window to the tray on Linux hides it properly now, instead of closing and reopening it.
+- The Linux packages need GTK 4.14 and libadwaita 1.5 or newer. Ubuntu 24.04, Debian 13, and Fedora 40 have them.
+- Windows is unchanged.
+
 New in 0.3.3:
 
 - On Linux, closing the window works again. With "close to the tray" on, the window closes and the app keeps running in the tray; Show opens it again. Before, on Wayland the window stayed where it was and nothing happened. Quit in the tray menu stops the app.
