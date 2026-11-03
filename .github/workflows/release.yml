@@ -77,7 +77,8 @@ jobs:
   linux:
     needs: version
     if: needs.version.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    # The oldest supported Ubuntu sets the glibc the .deb, .rpm and tarball need.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

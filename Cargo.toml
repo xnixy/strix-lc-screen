@@ -1,6 +1,6 @@
 [package]
 name = "strix-lc-screen"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Controller for the ROG Strix LC IV pump screen"
 license = "MIT"
@@ -50,6 +50,7 @@ assets = [
     "$auto",
     ["linux/60-strix-lc-screen.rules", "usr/lib/udev/rules.d/60-strix-lc-screen.rules", "644"],
     ["linux/strix-lc-screen.desktop", "usr/share/applications/strix-lc-screen.desktop", "644"],
+    ["assets/icon.svg", "usr/share/icons/hicolor/scalable/apps/strix-lc-screen.svg", "644"],
     ["packaging/ffmpeg", "usr/lib/strix-lc-screen/ffmpeg", "755"],
     ["packaging/FFMPEG.txt", "usr/share/doc/strix-lc-screen/ffmpeg.txt", "644"],
     ["assets/fonts/OFL.txt", "usr/share/doc/strix-lc-screen/font-license.txt", "644"],
@@ -62,6 +63,7 @@ assets = [
     { source = "target/release/strix-lc-screen", dest = "/usr/bin/strix-lc-screen", mode = "755" },
     { source = "linux/60-strix-lc-screen.rules", dest = "/usr/lib/udev/rules.d/60-strix-lc-screen.rules", mode = "644" },
     { source = "linux/strix-lc-screen.desktop", dest = "/usr/share/applications/strix-lc-screen.desktop", mode = "644" },
+    { source = "assets/icon.svg", dest = "/usr/share/icons/hicolor/scalable/apps/strix-lc-screen.svg", mode = "644" },
     { source = "packaging/ffmpeg", dest = "/usr/lib/strix-lc-screen/ffmpeg", mode = "755" },
     { source = "LICENSE", dest = "/usr/share/licenses/strix-lc-screen/LICENSE", mode = "644" },
     { source = "packaging/FFMPEG.txt", dest = "/usr/share/doc/strix-lc-screen/ffmpeg.txt", mode = "644", doc = true },

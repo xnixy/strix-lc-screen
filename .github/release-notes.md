@@ -9,9 +9,14 @@ A small app for the ROG Strix LC IV / SLC IV pump screen (USB 0B05:1DE7). It tal
 
 Either package installs the program and the USB permission. After it is installed, unplug the cooler and plug it back in, then run strix-lc-screen. The tarball has the same program, plus ffmpeg and the udev rule, if you would rather not use the package. Copy that rule, reload udev, and unplug the cooler once.
 
+New in 0.3.2:
+
+- The app has an icon on Linux: in the app list, the dock or taskbar, the window, and the tray.
+- The Linux builds run on Ubuntu 24.04, Debian 13, and Fedora 40 again. 0.3.1 needed a newer system than its .deb said.
+
 New in 0.3.1:
 
-- A Fedora package, strix-lc-screen-{{version}}-1.x86_64.rpm. Install it with sudo dnf install and the file name. Like the .deb, it adds the USB permission and includes ffmpeg.
+- A Fedora package, the .rpm. Install it with sudo dnf install and the file name. Like the .deb, it adds the USB permission and includes ffmpeg.
 
 New in 0.3.0:
 

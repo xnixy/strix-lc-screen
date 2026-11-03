@@ -230,7 +230,7 @@ fn startup_command(exe: &Path, hidden: bool) -> String {
 #[cfg(any(target_os = "linux", test))]
 fn autostart_desktop(exe: &Path, hidden: bool) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName=Pump screen\nExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        "[Desktop Entry]\nType=Application\nName=Pump screen\nIcon=strix-lc-screen\nExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
         startup_command(exe, hidden)
     )
 }

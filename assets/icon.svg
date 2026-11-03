@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2230"/>
+      <stop offset="1" stop-color="#100e14"/>
+    </linearGradient>
+    <linearGradient id="cap" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4a424c"/>
+      <stop offset="1" stop-color="#1c181e"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.85" cy="0.9" r="1.1">
+      <stop offset="0" stop-color="#e0506a"/>
+      <stop offset="0.45" stop-color="#7a1e32"/>
+      <stop offset="1" stop-color="#140c12"/>
+    </radialGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#tile)"/>
+  <circle cx="128" cy="128" r="94" fill="url(#cap)"/>
+  <circle cx="128" cy="128" r="94" fill="none" stroke="#ffffff" stroke-opacity="0.14" stroke-width="3"/>
+  <rect x="70" y="70" width="116" height="116" rx="20" fill="url(#glow)"/>
+  <rect x="70" y="70" width="116" height="116" rx="20" fill="none" stroke="#000000" stroke-opacity="0.6" stroke-width="4"/>
+  <rect x="88" y="98" width="56" height="14" rx="7" fill="#f0ecee"/>
+  <rect x="88" y="124" width="80" height="7" rx="3.5" fill="#f0ecee" fill-opacity="0.35"/>
+  <rect x="88" y="124" width="34" height="7" rx="3.5" fill="#c4364e"/>
+  <rect x="88" y="144" width="80" height="7" rx="3.5" fill="#f0ecee" fill-opacity="0.35"/>
+  <rect x="88" y="144" width="56" height="7" rx="3.5" fill="#c4364e"/>
+</svg>

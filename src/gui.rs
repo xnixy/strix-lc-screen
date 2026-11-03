@@ -621,7 +621,10 @@ pub fn run(start_in_tray: bool) -> eframe::Result<()> {
         .with_min_inner_size([1000.0, 660.0])
         .with_resizable(true)
         .with_decorations(true)
-        .with_title(window_title());
+        .with_title(window_title())
+        // Wayland desktops find the icon through the .desktop file with this name.
+        .with_app_id("strix-lc-screen")
+        .with_icon(app_icon());
     #[cfg(windows)]
     {
         viewport = viewport.with_transparent(true);
@@ -1715,7 +1718,7 @@ impl ksni::Tray for PumpTray {
     }
 
     fn icon_name(&self) -> String {
-        "video-display".into()
+        "strix-lc-screen".into()
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
@@ -1789,26 +1792,43 @@ fn sign_in_startup_label() -> &'static str {
     }
 }
 
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
+fn icon_rgba() -> image::RgbaImage {
+    image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png)
+        .expect("assets/icon.png is a PNG")
+        .into_rgba8()
+}
+
+/// The window icon. X11 and Windows show it; Wayland uses the installed icon.
+fn app_icon() -> egui::IconData {
+    let image = icon_rgba();
+    let (width, height) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
+}
+
+/// Used when the tray host cannot find the installed icon, as with the tarball.
 #[cfg(target_os = "linux")]
 fn pump_tray_pixmap() -> ksni::Icon {
-    let size = 32i32;
-    let mut data = vec![0u8; (size * size * 4) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x - 15;
-            let dy = y - 15;
-            if dx * dx + dy * dy <= 13 * 13 {
-                let index = ((y * size + x) * 4) as usize;
-                data[index] = 255;
-                data[index + 1] = 214;
-                data[index + 2] = 64;
-                data[index + 3] = 38;
-            }
-        }
-    }
+    let size = 32u32;
+    let image = image::imageops::resize(
+        &icon_rgba(),
+        size,
+        size,
+        image::imageops::FilterType::Lanczos3,
+    );
+    // StatusNotifierItem wants ARGB in network byte order.
+    let data = image
+        .pixels()
+        .flat_map(|p| [p[3], p[0], p[1], p[2]])
+        .collect();
     ksni::Icon {
-        width: size,
-        height: size,
+        width: size as i32,
+        height: size as i32,
         data,
     }
 }
@@ -2161,6 +2181,13 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_icon_decodes() {
+        let icon = app_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 
     #[test]
     fn the_frame_that_just_played_is_the_one_before_the_cursor() {
