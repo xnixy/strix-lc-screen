@@ -9,7 +9,9 @@ use crate::settings::{self, Settings, Source};
 use crate::theme;
 use anyhow::{Context, Result};
 use eframe::egui;
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -611,11 +613,45 @@ fn demo_page() -> Option<Page> {
     }
 }
 
+/// Linux closes the window to go to the tray and opens a new one to come back.
+/// Wayland cannot hide a window, so hiding it, as Windows does, would leave it on screen.
+const CLOSE_TO_TRAY_CLOSES_WINDOW: bool = cfg!(target_os = "linux");
+
 pub fn run(start_in_tray: bool) -> eframe::Result<()> {
     if !demo() && !settings::claim_single_instance() {
         return Ok(());
     }
     let (tray_tx, tray_rx) = std::sync::mpsc::sync_channel(64);
+    let waker = Waker::default();
+    settings::on_show_request({
+        let waker = waker.clone();
+        move || waker.wake()
+    });
+    let app = Rc::new(RefCell::new(App::new(
+        start_in_tray,
+        tray_tx,
+        tray_rx,
+        waker.clone(),
+    )));
+    let mut open = !(CLOSE_TO_TRAY_CLOSES_WINDOW && start_in_tray && app.borrow().tray.available);
+    loop {
+        if open {
+            app.borrow_mut().window_opened();
+            let result = open_window(&app, &waker);
+            waker.set(None);
+            result?;
+            if !app.borrow().parked {
+                return Ok(());
+            }
+        }
+        if !app.borrow_mut().wait_in_tray() {
+            return Ok(());
+        }
+        open = true;
+    }
+}
+
+fn open_window(app: &Rc<RefCell<App>>, waker: &Waker) -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1200.0, 780.0])
         .with_min_inner_size([1000.0, 660.0])
@@ -633,20 +669,47 @@ pub fn run(start_in_tray: bool) -> eframe::Result<()> {
         viewport,
         ..Default::default()
     };
+    let app = Rc::clone(app);
+    let waker = waker.clone();
     eframe::run_native(
         "Pump screen",
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
             let _ = apply_window_material();
-            let ctx = cc.egui_ctx.clone();
-            settings::on_show_request({
-                let ctx = ctx.clone();
-                move || ctx.request_repaint()
-            });
-            Ok(Box::new(App::new(start_in_tray, tray_tx, tray_rx, ctx)))
+            waker.set(Some(cc.egui_ctx.clone()));
+            Ok(Box::new(Window(app)))
         }),
     )
+}
+
+/// What eframe owns. The app itself outlives each window.
+struct Window(Rc<RefCell<App>>);
+
+impl eframe::App for Window {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        eframe::App::update(&mut *self.0.borrow_mut(), ctx, frame);
+    }
+
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        eframe::App::clear_color(&*self.0.borrow(), visuals)
+    }
+}
+
+/// The open window's context, so the tray and a second launch can wake it.
+#[derive(Clone, Default)]
+struct Waker(Arc<std::sync::Mutex<Option<egui::Context>>>);
+
+impl Waker {
+    fn set(&self, ctx: Option<egui::Context>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = ctx;
+    }
+
+    fn wake(&self) {
+        if let Some(ctx) = self.0.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            ctx.request_repaint();
+        }
+    }
 }
 
 enum TrayAction {
@@ -679,6 +742,8 @@ struct App {
     busy: bool,
     chosen: Option<PathBuf>,
     preview: Option<egui::TextureHandle>,
+    /// The decoded preview, kept so a new window can upload it again.
+    preview_image: Option<egui::ColorImage>,
     source_width: u32,
     source_height: u32,
     zoom: f32,
@@ -695,6 +760,8 @@ struct App {
     hide_once: bool,
     /// Window is parked off-screen. It stays visible to Windows so paints still arrive.
     in_tray: bool,
+    /// The window was closed to the tray, so the app keeps running without one.
+    parked: bool,
     resume_when_ready: bool,
     tray_rx: std::sync::mpsc::Receiver<TrayAction>,
     material_applied: bool,
@@ -746,7 +813,7 @@ impl App {
         start_in_tray: bool,
         tray_tx: std::sync::mpsc::SyncSender<TrayAction>,
         tray_rx: std::sync::mpsc::Receiver<TrayAction>,
-        ctx: egui::Context,
+        waker: Waker,
     ) -> Self {
         let saved = Settings::load();
         let stats = Arc::new(stats_panel::Shared::default());
@@ -787,6 +854,7 @@ impl App {
             busy: true,
             chosen,
             preview: None,
+            preview_image: None,
             source_width: 0,
             source_height: 0,
             zoom: saved.zoom.clamp(1.0, 4.0),
@@ -800,10 +868,11 @@ impl App {
                 .checked_sub(Duration::from_secs(10))
                 .unwrap_or_else(std::time::Instant::now),
             settings: saved,
-            tray: TrayMenu::build(tray_tx, ctx),
+            tray: TrayMenu::build(tray_tx, waker),
             quit: false,
-            hide_once: start_in_tray,
+            hide_once: start_in_tray && !CLOSE_TO_TRAY_CLOSES_WINDOW,
             in_tray: false,
+            parked: false,
             resume_when_ready,
             tray_rx,
             material_applied: false,
@@ -904,12 +973,13 @@ impl App {
         self.asus_checked = std::time::Instant::now();
     }
 
-    fn poll(&mut self, ctx: &egui::Context) {
+    /// Takes a finished job. Returns true when there was one.
+    fn poll(&mut self) -> bool {
         let Some(rx) = self.pending.as_ref() else {
-            return;
+            return false;
         };
         let Ok(result) = rx.try_recv() else {
-            return;
+            return false;
         };
         self.pending = None;
         self.busy = false;
@@ -979,7 +1049,39 @@ impl App {
                 self.pending = Some(spawn_snapshot_after_restart(&self.worker));
             }
         }
-        ctx.request_repaint();
+        true
+    }
+
+    /// Gets a new window ready. Textures belong to the window that made them.
+    fn window_opened(&mut self) {
+        self.parked = false;
+        self.in_tray = false;
+        self.material_applied = false;
+        self.window_fitted = false;
+        self.preview = None;
+        self.editor.forget_textures();
+    }
+
+    /// Runs while the window is closed to the tray. Returns false to quit.
+    fn wait_in_tray(&mut self) -> bool {
+        self.in_tray = true;
+        loop {
+            if settings::take_show_request() {
+                return true;
+            }
+            match self.tray_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(TrayAction::Show) => return true,
+                Ok(TrayAction::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+                Ok(TrayAction::Stop) => {
+                    self.worker.stop_playback();
+                    self.status = "Stopped. The last frame stays until you quit.".into();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            self.poll();
+            self.refresh_asus_flag();
+            self.sync_stats_panel();
+        }
     }
 
     fn poll_preview(&mut self, ctx: &egui::Context) {
@@ -998,6 +1100,7 @@ impl App {
                         [decoded.width() as usize, decoded.height() as usize],
                         decoded.as_raw(),
                     );
+                    self.preview_image = Some(color.clone());
                     self.preview =
                         Some(ctx.load_texture("preview", color, egui::TextureOptions::LINEAR));
                     self.source_width = preview.width;
@@ -1037,9 +1140,20 @@ impl eframe::App for App {
             && self.settings.close_to_tray
             && self.tray.available
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if park_pump_window(ctx) {
-                self.in_tray = true;
+            if CLOSE_TO_TRAY_CLOSES_WINDOW {
+                // Let it close. `run` keeps the app going in the tray.
+                self.parked = true;
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if park_pump_window(ctx) {
+                    self.in_tray = true;
+                }
+            }
+        }
+        if self.preview.is_none() {
+            if let Some(image) = self.preview_image.clone() {
+                self.preview =
+                    Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR));
             }
         }
         // Windows puts the window back on the taskbar unless the tool style is
@@ -1056,7 +1170,9 @@ impl eframe::App for App {
             self.material_applied = apply_window_material();
         }
         self.fit_window(ctx);
-        self.poll(ctx);
+        if self.poll() {
+            ctx.request_repaint();
+        }
         self.poll_preview(ctx);
         self.refresh_asus_flag();
         self.sync_stats_panel();
@@ -1368,6 +1484,7 @@ impl App {
             return;
         };
         self.preview = None;
+        self.preview_image = None;
         self.source_width = 0;
         self.source_height = 0;
         self.zoom = 1.0;
@@ -1621,25 +1738,25 @@ fn anyhow_worker() -> anyhow::Error {
 }
 
 impl TrayMenu {
-    fn build(tx: std::sync::mpsc::SyncSender<TrayAction>, ctx: egui::Context) -> Self {
+    fn build(tx: std::sync::mpsc::SyncSender<TrayAction>, waker: Waker) -> Self {
         #[cfg(windows)]
         {
-            build_windows_tray(tx, ctx)
+            build_windows_tray(tx, waker)
         }
         #[cfg(target_os = "linux")]
         {
-            build_linux_tray(tx, ctx)
+            build_linux_tray(tx, waker)
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
-            let _ = (tx, ctx);
+            let _ = (tx, waker);
             Self { available: false }
         }
     }
 }
 
 #[cfg(windows)]
-fn build_windows_tray(tx: std::sync::mpsc::SyncSender<TrayAction>, ctx: egui::Context) -> TrayMenu {
+fn build_windows_tray(tx: std::sync::mpsc::SyncSender<TrayAction>, waker: Waker) -> TrayMenu {
     use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
     let show = MenuItem::with_id("show", "Show", true, None);
     let stop = MenuItem::with_id("stop", "Stop video", true, None);
@@ -1653,13 +1770,13 @@ fn build_windows_tray(tx: std::sync::mpsc::SyncSender<TrayAction>, ctx: egui::Co
     let stop_id = stop.id().clone();
     let quit_id = quit.id().clone();
     let click_tx = tx.clone();
-    let click_ctx = ctx.clone();
+    let click_waker = waker.clone();
     tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
         if tray_click_shows_window(&event) {
             reveal_pump_window();
             let _ = click_tx.try_send(TrayAction::Show);
         }
-        click_ctx.request_repaint();
+        click_waker.wake();
     }));
     tray_icon::menu::MenuEvent::set_event_handler(Some(
         move |event: tray_icon::menu::MenuEvent| {
@@ -1673,7 +1790,7 @@ fn build_windows_tray(tx: std::sync::mpsc::SyncSender<TrayAction>, ctx: egui::Co
                 return;
             };
             let _ = tx.try_send(action);
-            ctx.request_repaint();
+            waker.wake();
         },
     ));
     let icon = tray_icon_image();
@@ -1696,14 +1813,14 @@ fn build_windows_tray(tx: std::sync::mpsc::SyncSender<TrayAction>, ctx: egui::Co
 #[cfg(target_os = "linux")]
 struct PumpTray {
     tx: std::sync::mpsc::SyncSender<TrayAction>,
-    ctx: egui::Context,
+    waker: Waker,
 }
 
 #[cfg(target_os = "linux")]
 impl PumpTray {
     fn send(&mut self, action: TrayAction) {
         let _ = self.tx.try_send(action);
-        self.ctx.request_repaint();
+        self.waker.wake();
     }
 }
 
@@ -1763,9 +1880,9 @@ impl ksni::Tray for PumpTray {
 }
 
 #[cfg(target_os = "linux")]
-fn build_linux_tray(tx: std::sync::mpsc::SyncSender<TrayAction>, ctx: egui::Context) -> TrayMenu {
+fn build_linux_tray(tx: std::sync::mpsc::SyncSender<TrayAction>, waker: Waker) -> TrayMenu {
     use ksni::blocking::TrayMethods;
-    let tray = PumpTray { tx, ctx };
+    let tray = PumpTray { tx, waker };
     match tray.spawn() {
         Ok(handle) => TrayMenu {
             available: true,

@@ -9,6 +9,10 @@ A small app for the ROG Strix LC IV / SLC IV pump screen (USB 0B05:1DE7). It tal
 
 Either package installs the program and the USB permission. After it is installed, unplug the cooler and plug it back in, then run strix-lc-screen. The tarball has the same program, plus ffmpeg and the udev rule, if you would rather not use the package. Copy that rule, reload udev, and unplug the cooler once.
 
+New in 0.3.3:
+
+- On Linux, closing the window works again. With "close to the tray" on, the window closes and the app keeps running in the tray; Show opens it again. Before, on Wayland the window stayed where it was and nothing happened. Quit in the tray menu stops the app.
+
 New in 0.3.2:
 
 - The app has an icon on Linux: in the app list, the dock or taskbar, the window, and the tray.

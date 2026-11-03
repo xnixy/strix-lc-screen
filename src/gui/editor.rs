@@ -95,6 +95,12 @@ impl Editor {
         }
     }
 
+    /// Drops the cached drawings. A new window has to upload them again.
+    pub fn forget_textures(&mut self) {
+        self.drawn = Default::default();
+        self.background = None;
+    }
+
     /// The widgets drawn by the same code that draws them for the pump.
     fn overlay(
         &mut self,
